@@ -27,5 +27,12 @@
             "poll_ms": 25
         }
     },
+    "usb_recovery": {
+        "enabled": true,
+        "timeout_ms": 20000,
+        "poll_ms": 25,
+        "expected_cycle_ms": 7000,
+        "max_stage_retries": 8
+    },
     "inter_stage_delay_ms": 100
 }
