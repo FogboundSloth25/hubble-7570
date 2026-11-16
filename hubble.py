@@ -213,7 +213,7 @@ def forensic_watch_after_chunk(device, filename, chunk_index, offset):
             "FORENSIC USB [%s chunk=%d offset=0x%X]: enumeration query failed",
             filename, chunk_index, offset
         )
-        raise RuntimeError(f"USB enumeration query failed after {filename} chunk {chunk_index}: {e}") from e
+        raise USBStreamInterrupted(f"USB enumeration query failed after {filename} chunk {chunk_index}: {e}") from e
 
     if current is not None:
         after = _usb_identity(current)
