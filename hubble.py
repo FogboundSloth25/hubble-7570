@@ -36,6 +36,11 @@ badcon = False
 debug_usb = False
 USB_BACKEND = None
 
+
+class USBStreamInterrupted(RuntimeError):
+    """A DNW frame was interrupted by a USB disconnect or short write."""
+
+
 def forensic_elapsed():
     if forensic_start_ns is None:
         return 0.0
@@ -293,7 +298,7 @@ def forensic_watch_after_chunk(device, filename, chunk_index, offset):
             before["bus"], before["ports"], filename, chunk_index
         )
 
-    raise RuntimeError(
+    raise USBStreamInterrupted(
         f"USB disappeared or re-enumerated immediately after successful {filename} "
         f"chunk {chunk_index} at offset 0x{offset:X}. Captured same-port enumeration; "
         "stopped before sending more bytes because the DNW frame cannot be resumed safely."
@@ -569,7 +574,7 @@ def _claim_usb_handle(device, stage):
     return device
 
 
-def wait_for_stage_reenumeration(device, stage):
+def wait_for_stage_reenumeration(device, stage, force=False):
     """
     Watch an explicitly configured stage boundary for a USB reset/re-enumeration.
 
@@ -579,9 +584,14 @@ def wait_for_stage_reenumeration(device, stage):
     happens within the configured window, keep using the original handle.
     """
     transitions = EXYNOS_DATA.get("stage_transitions", {})
-    policy = transitions.get(stage)
-    if not policy:
-        return device
+    if force:
+        policy = EXYNOS_DATA.get("usb_recovery", {})
+        if not policy.get("enabled", False):
+            raise RuntimeError("Automatic USB stream recovery is not enabled for this SoC profile.")
+    else:
+        policy = transitions.get(stage)
+        if not policy:
+            return device
 
     timeout = max(0.5, float(policy.get("timeout_ms", 10000)) / 1000.0)
     poll_interval = max(0.01, float(policy.get("poll_ms", 25)) / 1000.0)
@@ -592,11 +602,19 @@ def wait_for_stage_reenumeration(device, stage):
     old_product = _read_usb_string(device, getattr(device, "iProduct", 0))
     old_serial = _read_usb_string(device, getattr(device, "iSerialNumber", 0))
 
-    logger.warning(
-        "USB transition after %s: watching for re-enumeration for up to %.1fs "
-        "(bus=%s ports=%s address=%s serial=%s)",
-        stage, timeout, old_bus, old_ports, old_address, old_serial
-    )
+    if force:
+        expected_cycle = float(policy.get("expected_cycle_ms", 0)) / 1000.0
+        logger.warning(
+            "USB recovery after interrupted %s: waiting up to %.1fs for the same EUB "
+            "device to return on bus=%s ports=%s (observed cycle approximately %.1fs)",
+            stage, timeout, old_bus, old_ports, expected_cycle
+        )
+    else:
+        logger.warning(
+            "USB transition after %s: watching for re-enumeration for up to %.1fs "
+            "(bus=%s ports=%s address=%s serial=%s)",
+            stage, timeout, old_bus, old_ports, old_address, old_serial
+        )
 
     deadline = monotonic() + timeout
     saw_disconnect = False
@@ -683,6 +701,12 @@ def wait_for_stage_reenumeration(device, stage):
             f"within {timeout:.1f}s. Refusing to write the next stage through a stale USB handle."
         )
 
+    if force:
+        raise RuntimeError(
+            f"USB stream for {stage} was interrupted, but no fresh same-device "
+            f"enumeration appeared on the original USB path within {timeout:.1f}s."
+        )
+
     logger.warning(
         "USB transition after %s: no re-enumeration was observed within %.1fs; "
         "continuing with the existing connection",
@@ -755,7 +779,7 @@ def send_part_to_device(device, file, filename):
                         forensic_report_port(
                             device, f"write failure in {filename} chunk={chunk_index}"
                         )
-                raise RuntimeError(
+                raise USBStreamInterrupted(
                     f"USB write failed for {filename} at offset 0x{ret:X} "
                     f"({ret}/{file_size} bytes, chunk {chunk_index}, "
                     f"{elapsed:.3f}s). The stream cannot be resumed safely: {e}"
@@ -772,7 +796,7 @@ def send_part_to_device(device, file, filename):
                 )
 
             if written != len(chunk):
-                raise RuntimeError(
+                raise USBStreamInterrupted(
                     f"Short USB write for {filename} at offset 0x{ret:X}: "
                     f"{written} of {len(chunk)} bytes"
                 )
@@ -819,7 +843,9 @@ def send_part_to_device(device, file, filename):
                 )
                 debug_usb_presence(device, f"write failure in {filename}")
                 debug_usb_state(device, f"write failure in {filename}")
-            raise
+            raise USBStreamInterrupted(
+                f"USB write failed for {filename} ({file_size} bytes): {e}"
+            ) from e
         if debug_usb:
             logger.debug(
                 "USB DEBUG: OUT OK file=%s bytes=%d elapsed=%.3fs",
@@ -868,6 +894,41 @@ def send_part_to_device(device, file, filename):
         sys.exit(-1)
 
     print()
+
+
+def send_stage_with_retries(device, frame, filename):
+    """Retry a complete DNW frame only after the same EUB device re-enumerates."""
+    recovery = EXYNOS_DATA.get("usb_recovery", {})
+    recovery_enabled = recovery.get("enabled", False)
+    max_retries = max(0, int(recovery.get("max_stage_retries", 0))) if recovery_enabled else 0
+    attempt = 0
+
+    while True:
+        try:
+            if debug_usb and not debug_usb_presence(device, f"before {filename}"):
+                raise USBStreamInterrupted(
+                    f"USB device disappeared or re-enumerated before {filename}."
+                )
+            debug_usb_state(device, f"before {filename}")
+            send_part_to_device(device, frame, filename)
+            return device
+        except USBStreamInterrupted as e:
+            if not recovery_enabled or attempt >= max_retries:
+                raise
+
+            attempt += 1
+            logger.warning(
+                "DNW frame %s was interrupted (%s). Retry %d/%d: the partial frame "
+                "will NOT be resumed; waiting for a fresh EUB enumeration and then "
+                "resending the entire frame from offset 0.",
+                filename, e, attempt, max_retries
+            )
+            device = wait_for_stage_reenumeration(device, filename, force=True)
+            logger.warning(
+                "EUB returned after interrupted %s; retrying the complete DNW frame.",
+                filename
+            )
+
 
 def extract_bl_tar(path):
     output_dir = "./output/"
@@ -1113,12 +1174,6 @@ def main():
     with open("output/sboot.bin", "rb") as sboot:
         for img_name, split_params in EXYNOS_DATA["bootloader_splits"].items():
             try:
-                if debug_usb and not debug_usb_presence(device, f"before {img_name}"):
-                    raise RuntimeError(
-                        f"USB device disappeared or re-enumerated before {img_name}; "
-                        "check the previous EUB stage and kernel USB log."
-                    )
-                debug_usb_state(device, f"before {img_name}")
                 logger.debug(f"Sending file part {img_name} (0x{split_params["start"]:X} - 0x{split_params["start"] + split_params["length"]:X})...")
 
                 sboot.seek(split_params["start"])
@@ -1128,7 +1183,7 @@ def main():
                     logger.critical(f"Failed to load {img_name}")
                     sys.exit(-1)
 
-                send_part_to_device(device, sboot_section, img_name)
+                device = send_stage_with_retries(device, sboot_section, img_name)
                 stage_delay_ms = int(EXYNOS_DATA.get("inter_stage_delay_ms", 0))
                 if stage_delay_ms > 0:
                     logger.debug("Waiting %d ms before the next boot stage...", stage_delay_ms)
