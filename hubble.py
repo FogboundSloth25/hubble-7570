@@ -1247,7 +1247,13 @@ def main():
                     logger.debug("Waiting %d ms before the next boot stage...", stage_delay_ms)
                     sleep(stage_delay_ms / 1000.0)
                 device = wait_for_stage_reenumeration(device, img_name)
-                if img_name not in EXYNOS_DATA.get("fast_transition_stages", []):
+                if img_name in EXYNOS_DATA.get("single_transfer_stages", []):
+                    logger.warning(
+                        "USB fast transfer [%s]: skipping post-transfer USB probes; "
+                        "the loaded stage may already be changing the USB state",
+                        img_name
+                    )
+                elif img_name not in EXYNOS_DATA.get("fast_transition_stages", []):
                     debug_usb_presence(device, f"after {img_name}")
                     debug_usb_state(device, f"after {img_name}")
                 else:
@@ -1276,8 +1282,15 @@ def main():
         except:
             pass
 
-    usb.util.release_interface(device, 0)
-    usb.util.dispose_resources(device)
+    try:
+        usb.util.release_interface(device, 0)
+    except Exception as e:
+        logger.debug("Cleanup: interface release was not possible: %s", e)
+
+    try:
+        usb.util.dispose_resources(device)
+    except Exception as e:
+        logger.debug("Cleanup: USB handle disposal warning: %s", e)
 
     logger.warning("Cleaning up...")
     print()
