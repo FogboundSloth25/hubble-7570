@@ -548,11 +548,12 @@ def _same_usb_path(device, bus, ports):
     return True
 
 
-def _dispose_usb_handle(device, stage):
-    try:
-        usb.util.release_interface(device, 0)
-    except Exception as e:
-        logger.debug("USB transition [%s]: old interface release was not possible: %s", stage, e)
+def _dispose_usb_handle(device, stage, fast=False):
+    if not fast:
+        try:
+            usb.util.release_interface(device, 0)
+        except Exception as e:
+            logger.debug("USB transition [%s]: old interface release was not possible: %s", stage, e)
 
     try:
         usb.util.dispose_resources(device)
@@ -560,7 +561,7 @@ def _dispose_usb_handle(device, stage):
         logger.debug("USB transition [%s]: old handle cleanup warning: %s", stage, e)
 
 
-def _claim_usb_handle(device, stage):
+def _claim_usb_handle(device, stage, fast=False):
     if os.name != "nt":
         try:
             if device.is_kernel_driver_active(0):
@@ -568,9 +569,15 @@ def _claim_usb_handle(device, stage):
         except Exception as e:
             logger.debug("USB transition [%s]: kernel-driver detach check: %s", stage, e)
 
-    device.get_active_configuration()
+    # The kernel has already configured this freshly enumerated EUB device.
+    # Avoid another GET_DESCRIPTOR walk on the short BL2 -> U-Boot reconnect.
+    if not fast:
+        device.get_active_configuration()
     usb.util.claim_interface(device, 0)
-    debug_usb_state(device, stage)
+    if not fast:
+        debug_usb_state(device, stage)
+    else:
+        logger.warning("USB fast path [%s]: interface 0 claimed without descriptor probing", stage)
     return device
 
 
@@ -596,11 +603,25 @@ def wait_for_stage_reenumeration(device, stage, force=False):
     timeout = max(0.5, float(policy.get("timeout_ms", 10000)) / 1000.0)
     poll_interval = max(0.01, float(policy.get("poll_ms", 25)) / 1000.0)
 
+    fast_reconnect = bool(policy.get("fast_reconnect", False)) and not force
     old_bus = getattr(device, "bus", None)
     old_ports = getattr(device, "port_numbers", None)
     old_address = getattr(device, "address", None)
-    old_product = _read_usb_string(device, getattr(device, "iProduct", 0))
-    old_serial = _read_usb_string(device, getattr(device, "iSerialNumber", 0))
+
+    # The old handle may already refer to a disconnected EUB device. Reading
+    # its string descriptors can consume the entire short reconnect window.
+    # In fast mode, the same VID:PID on the same physical port is our identity.
+    if fast_reconnect:
+        old_product = None
+        old_serial = None
+        logger.warning(
+            "USB fast transition after %s: using cached bus/port/address only; "
+            "skipping string reads from the old handle",
+            stage
+        )
+    else:
+        old_product = _read_usb_string(device, getattr(device, "iProduct", 0))
+        old_serial = _read_usb_string(device, getattr(device, "iSerialNumber", 0))
 
     if force:
         expected_cycle = float(policy.get("expected_cycle_ms", 0)) / 1000.0
@@ -639,7 +660,7 @@ def wait_for_stage_reenumeration(device, stage, force=False):
                     "USB transition after %s: 04e8:1234 disappeared; waiting for the same device to return",
                     stage
                 )
-                _dispose_usb_handle(device, stage)
+                _dispose_usb_handle(device, stage, fast=fast_reconnect)
                 old_handle_disposed = True
             sleep(poll_interval)
             continue
@@ -654,31 +675,35 @@ def wait_for_stage_reenumeration(device, stage, force=False):
             sleep(poll_interval)
             continue
 
-        current_product = _read_usb_string(current, getattr(current, "iProduct", 0))
-        current_serial = _read_usb_string(current, getattr(current, "iSerialNumber", 0))
+        if fast_reconnect:
+            current_product = None
+            current_serial = None
+        else:
+            current_product = _read_usb_string(current, getattr(current, "iProduct", 0))
+            current_serial = _read_usb_string(current, getattr(current, "iSerialNumber", 0))
 
-        if old_product and current_product != old_product:
-            logger.debug(
-                "USB transition after %s: ignoring product mismatch %r (expected %r)",
-                stage, current_product, old_product
-            )
-            sleep(poll_interval)
-            continue
+            if old_product and current_product != old_product:
+                logger.debug(
+                    "USB transition after %s: ignoring product mismatch %r (expected %r)",
+                    stage, current_product, old_product
+                )
+                sleep(poll_interval)
+                continue
 
-        if old_serial and current_serial != old_serial:
-            logger.debug(
-                "USB transition after %s: ignoring serial mismatch %r (expected %r)",
-                stage, current_serial, old_serial
-            )
-            sleep(poll_interval)
-            continue
+            if old_serial and current_serial != old_serial:
+                logger.debug(
+                    "USB transition after %s: ignoring serial mismatch %r (expected %r)",
+                    stage, current_serial, old_serial
+                )
+                sleep(poll_interval)
+                continue
 
         if not old_handle_disposed:
-            _dispose_usb_handle(device, stage)
+            _dispose_usb_handle(device, stage, fast=fast_reconnect)
             old_handle_disposed = True
 
         try:
-            _claim_usb_handle(current, f"re-enumerated after {stage}")
+            _claim_usb_handle(current, f"re-enumerated after {stage}", fast=fast_reconnect)
         except Exception as e:
             usb.util.dispose_resources(current)
             raise RuntimeError(
@@ -691,7 +716,7 @@ def wait_for_stage_reenumeration(device, stage, force=False):
             getattr(current, "bus", None),
             getattr(current, "port_numbers", None),
             getattr(current, "address", None),
-            current_serial
+            current_serial if current_serial is not None else "<not-read-fast-path>"
         )
         return current
 
@@ -717,8 +742,18 @@ def wait_for_stage_reenumeration(device, stage, force=False):
 
 def send_part_to_device(device, file, filename):
     file_size = len(file)
+    single_transfer_stages = EXYNOS_DATA.get("single_transfer_stages", [])
+    single_transfer = filename in single_transfer_stages
+    use_chunked_transfer = badcon and not single_transfer
 
     logger.warning(f"=> Uploading {file_size} bytes")
+    if single_transfer and badcon:
+        logger.warning(
+            "USB fast transfer [%s]: overriding --badcon and submitting one Bulk OUT "
+            "request; the USB host controller still packetizes it at the endpoint's "
+            "512-byte maximum packet size",
+            filename
+        )
 
     write_header(file, file_size)
     append_checksum(file)
@@ -730,7 +765,7 @@ def send_part_to_device(device, file, filename):
             filename, forensic_elapsed()
         )
 
-    if badcon:
+    if use_chunked_transfer:
         # Keep the EUB frame intact, but split its USB Bulk OUT stream into
         # small transfers. 512 bytes matches a documented Exynos BootROM
         # implementation; Exynos 7570 still needs hardware validation.
@@ -898,7 +933,8 @@ def send_part_to_device(device, file, filename):
 
 
 def send_stage_with_retries(device, frame, filename):
-    """Retry a complete DNW frame only after the same EUB device re-enumerates."""
+    """Send one complete DNW frame, with only profile-authorized recovery."""
+    fast_transfer = filename in EXYNOS_DATA.get("single_transfer_stages", [])
     recovery = EXYNOS_DATA.get("usb_recovery", {})
     recovery_enabled = recovery.get("enabled", False)
     max_retries = max(0, int(recovery.get("max_stage_retries", 0))) if recovery_enabled else 0
@@ -906,11 +942,17 @@ def send_stage_with_retries(device, frame, filename):
 
     while True:
         try:
-            if debug_usb and not debug_usb_presence(device, f"before {filename}"):
-                raise USBStreamInterrupted(
-                    f"USB device disappeared or re-enumerated before {filename}."
+            if not fast_transfer:
+                if debug_usb and not debug_usb_presence(device, f"before {filename}"):
+                    raise USBStreamInterrupted(
+                        f"USB device disappeared or re-enumerated before {filename}."
+                    )
+                debug_usb_state(device, f"before {filename}")
+            else:
+                logger.warning(
+                    "USB fast transfer [%s]: skipping pre-transfer enumeration/configuration probes",
+                    filename
                 )
-            debug_usb_state(device, f"before {filename}")
             send_part_to_device(device, frame, filename)
             return device
         except USBStreamInterrupted as e:
@@ -1190,8 +1232,15 @@ def main():
                     logger.debug("Waiting %d ms before the next boot stage...", stage_delay_ms)
                     sleep(stage_delay_ms / 1000.0)
                 device = wait_for_stage_reenumeration(device, img_name)
-                debug_usb_presence(device, f"after {img_name}")
-                debug_usb_state(device, f"after {img_name}")
+                if img_name not in EXYNOS_DATA.get("fast_transition_stages", []):
+                    debug_usb_presence(device, f"after {img_name}")
+                    debug_usb_state(device, f"after {img_name}")
+                else:
+                    logger.warning(
+                        "USB fast transition after %s: skipping post-reconnect diagnostics "
+                        "so the next stage can start immediately",
+                        img_name
+                    )
             except Exception as e:
                 logger.critical(f"Error when trying to process sboot.bin! ({e})")
                 sys.exit(-1)
