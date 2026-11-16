@@ -26,7 +26,7 @@
   - Experimental profiles require the explicit ```--allow-experimental``` option.
   - Use ```--badcon``` for unstable USB links. It sends each EUB frame as consecutive 512-byte USB Bulk OUT transfers.
   - ```--badcon``` does not retry a failed chunk: the BootROM does not provide a confirmed per-chunk resume/ack mechanism in this tool, so retrying blindly could corrupt the stream.
-  - Add ```--debug-usb``` to log USB endpoint descriptors and verify whether the device is still enumerated before and after each EUB stage. On Linux, also capture ```sudo dmesg -w``` in a second terminal.
+  - Add ```--debug``` (or ```--debug-usb```) to log USB endpoint descriptors, enumeration state, and the start/result/duration of every Bulk OUT write. On Linux, also capture ```sudo dmesg -w``` in a second terminal.
   - Plug in your bricked phone
   - Let it run it's magic
   - Reflash the stock firmware

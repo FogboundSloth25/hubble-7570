@@ -13,7 +13,7 @@ import sys
 import os
 import coloredlogs
 import logging
-from time import sleep
+from time import sleep, monotonic
 import re
 
 EXYNOS_DATA = None
@@ -207,26 +207,49 @@ def send_part_to_device(device, file, filename):
         while ret < file_size:
             chunk = file[ret:ret + chunk_size]
 
+            chunk_index = (ret // chunk_size) + 1
+            transfer_started = monotonic()
+
+            if debug_usb:
+                logger.debug(
+                    "USB DEBUG: OUT BEGIN file=%s chunk=%d offset=0x%X size=%d timeout=50000ms",
+                    filename, chunk_index, ret, len(chunk)
+                )
+
             try:
                 written = device.write(2, chunk, timeout=50000)
             except Exception as e:
+                elapsed = monotonic() - transfer_started
                 if debug_usb:
                     logger.exception(
-                        "USB DEBUG: Bulk OUT failed: file=%s offset=0x%X "
-                        "chunk=%s total=%s errno=%s backend_error_code=%s",
+                        "USB DEBUG: OUT FAILED file=%s chunk=%d offset=0x%X "
+                        "chunk_size=%d total=%d elapsed=%.3fs errno=%s "
+                        "backend_error_code=%s args=%r",
                         filename,
+                        chunk_index,
                         ret,
                         len(chunk),
                         file_size,
+                        elapsed,
                         getattr(e, "errno", None),
                         getattr(e, "backend_error_code", None),
+                        getattr(e, "args", None),
                     )
                     debug_usb_presence(device, f"write failure in {filename}")
                     debug_usb_state(device, f"write failure in {filename}")
                 raise RuntimeError(
                     f"USB write failed for {filename} at offset 0x{ret:X} "
-                    f"({ret}/{file_size} bytes). The stream cannot be resumed safely: {e}"
+                    f"({ret}/{file_size} bytes, chunk {chunk_index}, "
+                    f"{elapsed:.3f}s). The stream cannot be resumed safely: {e}"
                 ) from e
+
+            elapsed = monotonic() - transfer_started
+            if debug_usb:
+                logger.debug(
+                    "USB DEBUG: OUT OK file=%s chunk=%d offset=0x%X "
+                    "size=%d elapsed=%.3fs",
+                    filename, chunk_index, ret, written, elapsed
+                )
 
             if written != len(chunk):
                 raise RuntimeError(
@@ -241,20 +264,35 @@ def send_part_to_device(device, file, filename):
                 while next_progress <= ret:
                     next_progress += 128 * 1024
     else:
+        transfer_started = monotonic()
+        if debug_usb:
+            logger.debug(
+                "USB DEBUG: OUT BEGIN file=%s size=%d timeout=50000ms",
+                filename, file_size
+            )
         try:
             ret = device.write(2, file, timeout=50000)
         except Exception as e:
+            elapsed = monotonic() - transfer_started
             if debug_usb:
                 logger.exception(
-                    "USB DEBUG: Bulk OUT failed: file=%s bytes=%s errno=%s backend_error_code=%s",
+                    "USB DEBUG: OUT FAILED file=%s bytes=%s elapsed=%.3fs "
+                    "errno=%s backend_error_code=%s args=%r",
                     filename,
                     file_size,
+                    elapsed,
                     getattr(e, "errno", None),
                     getattr(e, "backend_error_code", None),
+                    getattr(e, "args", None),
                 )
                 debug_usb_presence(device, f"write failure in {filename}")
                 debug_usb_state(device, f"write failure in {filename}")
             raise
+        if debug_usb:
+            logger.debug(
+                "USB DEBUG: OUT OK file=%s bytes=%d elapsed=%.3fs",
+                filename, ret, monotonic() - transfer_started
+            )
 
     if EXYNOS_DATA["response_support"] == True and verbose == True:
         while True:
@@ -473,7 +511,7 @@ def main():
     parser.add_argument('-v', '--verbose', action="store_true", help="Enables more Logs during Operation")
     parser.add_argument('--allow-experimental', action="store_true", help="Allow an experimental SoC profile after reviewing its limitations")
     parser.add_argument('--badcon', action="store_true", help="Send EUB data in 512-byte USB Bulk OUT chunks for unstable connections")
-    parser.add_argument('--debug-usb', action="store_true", help="Log USB descriptors and check whether the Exynos device disconnects between EUB stages")
+    parser.add_argument('--debug', '--debug-usb', dest="debug_usb", action="store_true", help="Log USB descriptors, device presence, and timing/errors for every Bulk OUT transfer")
 
     args = parser.parse_args()
     allow_experimental = args.allow_experimental
@@ -494,7 +532,7 @@ def main():
         logger.warning("Bad connection mode enabled: 512-byte USB Bulk OUT chunks; automatic retries are disabled.")
 
     if debug_usb:
-        logger.warning("USB debug mode enabled: device presence and endpoint state will be checked around every EUB stage.")
+        logger.warning("USB debug mode enabled: descriptors, enumeration, and Bulk OUT transfer timing will be logged.")
 
     logger.warning("Extracting files...")
     extract_bl_tar(args.bl_tar)
