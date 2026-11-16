@@ -261,10 +261,10 @@ def forensic_watch_after_chunk(device, filename, chunk_index, offset):
                 )
         else:
             logger.error(
-            "FORENSIC USB POST-CHUNK: identity changed immediately after %s "
-            "chunk=%d offset=0x%X before=%s after=%s",
-            filename, chunk_index, offset, before, after
-        )
+                "FORENSIC USB POST-CHUNK: identity changed immediately after %s "
+                "chunk=%d offset=0x%X before=%s after=%s",
+                filename, chunk_index, offset, before, after
+            )
     else:
         logger.error(
             "FORENSIC USB POST-CHUNK: 04e8:1234 disappeared immediately after %s "
@@ -779,15 +779,17 @@ def send_part_to_device(device, file, filename):
 
             ret += written
 
+            if forensic_mode and probe_bulk_in and chunk_index == 1:
+                # Read a possible BootROM response before the EP0 liveness test
+                # can abort on a simultaneous device reset.
+                forensic_probe_bulk_in(device, f"after first chunk {filename}")
+
             if forensic_mode and (
                 chunk_index == 1 or (chunk_index % 64 == 0 and ret < file_size)
             ):
                 forensic_watch_after_chunk(
                     device, filename, chunk_index, ret - written
                 )
-
-            if forensic_mode and probe_bulk_in and chunk_index == 1:
-                forensic_probe_bulk_in(device, f"after first chunk {filename}")
 
             if ret >= next_progress or ret == file_size:
                 logger.info(f"=> {ret}/{file_size} bytes transferred")
