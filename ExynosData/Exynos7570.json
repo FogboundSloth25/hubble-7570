@@ -24,15 +24,21 @@
     "stage_transitions": {
         "bl2.bin": {
             "timeout_ms": 10000,
-            "poll_ms": 25
+            "poll_ms": 10,
+            "fast_reconnect": true
         }
     },
+    "fast_transition_stages": [
+        "bl2.bin"
+    ],
+    "single_transfer_stages": [
+        "u-boot.bin"
+    ],
     "usb_recovery": {
         "enabled": true,
         "timeout_ms": 20000,
         "poll_ms": 25,
-        "expected_cycle_ms": 7000,
-        "max_stage_retries": 8
+        "max_stage_retries": 0
     },
-    "inter_stage_delay_ms": 100
+    "inter_stage_delay_ms": 0
 }
