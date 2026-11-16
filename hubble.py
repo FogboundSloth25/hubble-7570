@@ -67,15 +67,15 @@ def find_device():
         device = usb.core.find(idVendor=0x04e8, idProduct=0x1234, backend=USB_BACKEND)
 
         if device is None:
-            if device_connection_attempts == 15:
-                device_connection_attempts = 0
-
+            if device_connection_attempts and device_connection_attempts % 300 == 0:
                 print()
-                logger.debug(f"Tip: Plug in your device with the power button pressed.")
+                logger.debug("Tip: Keep the EUB button pressed; waiting for 04e8:1234.")
 
-            print(".", end="", flush=True)
+            if device_connection_attempts % 20 == 0:
+                print(".", end="", flush=True)
+
             device_connection_attempts += 1
-            sleep(1)
+            sleep(0.05)
         else:
             print()
             return device
@@ -185,6 +185,174 @@ def debug_usb_presence(device, stage):
         return False
 
     return True
+
+
+def _read_usb_string(device, descriptor_index):
+    if not descriptor_index:
+        return None
+    try:
+        value = usb.util.get_string(device, descriptor_index)
+        return value.strip("\\0") if value else None
+    except Exception:
+        return None
+
+
+def _same_usb_path(device, bus, ports):
+    device_bus = getattr(device, "bus", None)
+    device_ports = getattr(device, "port_numbers", None)
+
+    if bus is not None and device_bus is not None and device_bus != bus:
+        return False
+    if ports is not None and device_ports is not None and device_ports != ports:
+        return False
+    return True
+
+
+def _dispose_usb_handle(device, stage):
+    try:
+        usb.util.release_interface(device, 0)
+    except Exception as e:
+        logger.debug("USB transition [%s]: old interface release was not possible: %s", stage, e)
+
+    try:
+        usb.util.dispose_resources(device)
+    except Exception as e:
+        logger.debug("USB transition [%s]: old handle cleanup warning: %s", stage, e)
+
+
+def _claim_usb_handle(device, stage):
+    if os.name != "nt":
+        try:
+            if device.is_kernel_driver_active(0):
+                device.detach_kernel_driver(0)
+        except Exception as e:
+            logger.debug("USB transition [%s]: kernel-driver detach check: %s", stage, e)
+
+    usb.util.claim_interface(device, 0)
+    debug_usb_state(device, stage)
+    return device
+
+
+def wait_for_stage_reenumeration(device, stage):
+    """
+    Watch an explicitly configured stage boundary for a USB reset/re-enumeration.
+
+    Some older Exynos EUB implementations re-enumerate between boot stages.
+    When that happens, the previous PyUSB handle is stale; find and claim the
+    same device again by physical USB path and serial number. If no disconnect
+    happens within the configured window, keep using the original handle.
+    """
+    transitions = EXYNOS_DATA.get("stage_transitions", {})
+    policy = transitions.get(stage)
+    if not policy:
+        return device
+
+    timeout = max(0.5, float(policy.get("timeout_ms", 10000)) / 1000.0)
+    poll_interval = max(0.01, float(policy.get("poll_ms", 25)) / 1000.0)
+
+    old_bus = getattr(device, "bus", None)
+    old_ports = getattr(device, "port_numbers", None)
+    old_address = getattr(device, "address", None)
+    old_product = _read_usb_string(device, getattr(device, "iProduct", 0))
+    old_serial = _read_usb_string(device, getattr(device, "iSerialNumber", 0))
+
+    logger.warning(
+        "USB transition after %s: watching for re-enumeration for up to %.1fs "
+        "(bus=%s ports=%s address=%s serial=%s)",
+        stage, timeout, old_bus, old_ports, old_address, old_serial
+    )
+
+    deadline = monotonic() + timeout
+    saw_disconnect = False
+    old_handle_disposed = False
+
+    while monotonic() < deadline:
+        try:
+            current = usb.core.find(
+                idVendor=0x04e8,
+                idProduct=0x1234,
+                backend=USB_BACKEND,
+            )
+        except Exception:
+            logger.exception("USB transition after %s: enumeration check failed", stage)
+            sleep(poll_interval)
+            continue
+
+        if current is None:
+            if not saw_disconnect:
+                saw_disconnect = True
+                logger.warning(
+                    "USB transition after %s: 04e8:1234 disappeared; waiting for the same device to return",
+                    stage
+                )
+                _dispose_usb_handle(device, stage)
+                old_handle_disposed = True
+            sleep(poll_interval)
+            continue
+
+        if not _same_usb_path(current, old_bus, old_ports):
+            sleep(poll_interval)
+            continue
+
+        current_address = getattr(current, "address", None)
+        is_new_enumeration = saw_disconnect or current_address != old_address
+        if not is_new_enumeration:
+            sleep(poll_interval)
+            continue
+
+        current_product = _read_usb_string(current, getattr(current, "iProduct", 0))
+        current_serial = _read_usb_string(current, getattr(current, "iSerialNumber", 0))
+
+        if old_product and current_product != old_product:
+            logger.debug(
+                "USB transition after %s: ignoring product mismatch %r (expected %r)",
+                stage, current_product, old_product
+            )
+            sleep(poll_interval)
+            continue
+
+        if old_serial and current_serial != old_serial:
+            logger.debug(
+                "USB transition after %s: ignoring serial mismatch %r (expected %r)",
+                stage, current_serial, old_serial
+            )
+            sleep(poll_interval)
+            continue
+
+        if not old_handle_disposed:
+            _dispose_usb_handle(device, stage)
+            old_handle_disposed = True
+
+        try:
+            _claim_usb_handle(current, f"re-enumerated after {stage}")
+        except Exception as e:
+            usb.util.dispose_resources(current)
+            raise RuntimeError(
+                f"Exynos re-enumerated after {stage}, but interface 0 could not be reclaimed: {e}"
+            ) from e
+
+        logger.warning(
+            "USB transition after %s: reclaimed Exynos at bus=%s ports=%s address=%s serial=%s",
+            stage,
+            getattr(current, "bus", None),
+            getattr(current, "port_numbers", None),
+            getattr(current, "address", None),
+            current_serial
+        )
+        return current
+
+    if saw_disconnect:
+        raise RuntimeError(
+            f"Exynos disappeared after {stage} but did not return as the same EUB device "
+            f"within {timeout:.1f}s. Refusing to write the next stage through a stale USB handle."
+        )
+
+    logger.warning(
+        "USB transition after %s: no re-enumeration was observed within %.1fs; "
+        "continuing with the existing connection",
+        stage, timeout
+    )
+    return device
 
 
 def send_part_to_device(device, file, filename):
@@ -575,6 +743,7 @@ def main():
                     sys.exit(-1)
 
                 send_part_to_device(device, sboot_section, img_name)
+                device = wait_for_stage_reenumeration(device, img_name)
                 debug_usb_presence(device, f"after {img_name}")
                 debug_usb_state(device, f"after {img_name}")
             except Exception as e:

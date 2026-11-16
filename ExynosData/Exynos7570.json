@@ -20,5 +20,11 @@
             "start": 184320,
             "length": 856064
         }
+    },
+    "stage_transitions": {
+        "bl2.bin": {
+            "timeout_ms": 10000,
+            "poll_ms": 25
+        }
     }
-}
+}\n
