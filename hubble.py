@@ -69,7 +69,7 @@ def start_forensic_capture():
 
     forensic_start_ns = perf_counter_ns()
     os.makedirs("logs", exist_ok=True)
-    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
     forensic_log_path = os.path.join("logs", f"hubble-forensic-{stamp}.log")
     kernel_log_path = os.path.join("logs", f"hubble-dmesg-{stamp}.log")
 
@@ -131,21 +131,25 @@ def _usb_descriptor_string(device, descriptor_index):
         return f"<unreadable: {type(e).__name__}: {e}>"
 
 
-def _usb_identity(device):
-    return {
+def _usb_identity(device, include_strings=False):
+    identity = {
         "vid": getattr(device, "idVendor", None),
         "pid": getattr(device, "idProduct", None),
         "bus": getattr(device, "bus", None),
         "address": getattr(device, "address", None),
         "ports": getattr(device, "port_numbers", None),
         "speed": getattr(device, "speed", None),
-        "manufacturer": _usb_descriptor_string(device, getattr(device, "iManufacturer", 0)),
-        "product": _usb_descriptor_string(device, getattr(device, "iProduct", 0)),
-        "serial": _usb_descriptor_string(device, getattr(device, "iSerialNumber", 0)),
         "bcdUSB": getattr(device, "bcdUSB", None),
         "bcdDevice": getattr(device, "bcdDevice", None),
         "bMaxPacketSize0": getattr(device, "bMaxPacketSize0", None),
     }
+    if include_strings:
+        identity.update({
+            "manufacturer": _usb_descriptor_string(device, getattr(device, "iManufacturer", 0)),
+            "product": _usb_descriptor_string(device, getattr(device, "iProduct", 0)),
+            "serial": _usb_descriptor_string(device, getattr(device, "iSerialNumber", 0)),
+        })
+    return identity
 
 
 def _devices_on_same_port(reference_device):
@@ -178,7 +182,7 @@ def forensic_report_port(reference_device, context):
         return []
 
     for candidate in devices:
-        logger.warning("FORENSIC USB [%s]: same-port identity=%s", context, _usb_identity(candidate))
+        logger.warning("FORENSIC USB [%s]: same-port identity=%s", context, _usb_identity(candidate, include_strings=True))
     return devices
 
 
@@ -232,7 +236,7 @@ def forensic_watch_after_chunk(device, filename, chunk_index, offset):
     while monotonic() < deadline:
         candidates = _devices_on_same_port(device)
         if candidates:
-            same_port_identities = [_usb_identity(candidate) for candidate in candidates]
+            same_port_identities = [_usb_identity(candidate, include_strings=True) for candidate in candidates]
             logger.warning(
                 "FORENSIC USB POST-CHUNK: device(s) returned on the same port after "
                 "%s chunk=%d: %s",
