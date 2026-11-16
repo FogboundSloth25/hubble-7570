@@ -35,7 +35,7 @@
         "u-boot.bin"
     ],
     "usb_recovery": {
-        "enabled": true,
+        "enabled": false,
         "timeout_ms": 20000,
         "poll_ms": 25,
         "max_stage_retries": 0
