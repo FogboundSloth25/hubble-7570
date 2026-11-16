@@ -22,6 +22,7 @@ soc     = ""
 logger  = logging.getLogger(__name__)
 verbose = False
 allow_experimental = False
+badcon = False
 
 def write_u32(value):
     return struct.pack('<I', value)
@@ -109,7 +110,40 @@ def send_part_to_device(device, file, filename):
     write_header(file, file_size)
     append_checksum(file)
 
-    ret = device.write(2, file, timeout=50000)
+    if badcon:
+        # Keep the EUB frame intact, but split its USB Bulk OUT stream into
+        # small transfers. 512 bytes matches a documented Exynos BootROM
+        # implementation; Exynos 7570 still needs hardware validation.
+        chunk_size = 512
+        logger.warning(f"=> Bad connection mode: sending in {chunk_size}-byte USB chunks")
+        ret = 0
+        next_progress = 128 * 1024
+
+        while ret < file_size:
+            chunk = file[ret:ret + chunk_size]
+
+            try:
+                written = device.write(2, chunk, timeout=50000)
+            except Exception as e:
+                raise RuntimeError(
+                    f"USB write failed for {filename} at offset 0x{ret:X} "
+                    f"({ret}/{file_size} bytes). The stream cannot be resumed safely: {e}"
+                ) from e
+
+            if written != len(chunk):
+                raise RuntimeError(
+                    f"Short USB write for {filename} at offset 0x{ret:X}: "
+                    f"{written} of {len(chunk)} bytes"
+                )
+
+            ret += written
+
+            if ret >= next_progress or ret == file_size:
+                logger.info(f"=> {ret}/{file_size} bytes transferred")
+                while next_progress <= ret:
+                    next_progress += 128 * 1024
+    else:
+        ret = device.write(2, file, timeout=50000)
 
     if EXYNOS_DATA["response_support"] == True and verbose == True:
         while True:
@@ -287,7 +321,7 @@ def validate_sboot_image(path):
 
 
 def main():
-    global verbose, allow_experimental
+    global verbose, allow_experimental, badcon
 
     coloredlogs.install(
         level="DEBUG",
@@ -327,9 +361,11 @@ def main():
     parser.add_argument('-b', '--bl-tar', type=str, help="Path to the .tar or .tar.md5 file", required=True)
     parser.add_argument('-v', '--verbose', action="store_true", help="Enables more Logs during Operation")
     parser.add_argument('--allow-experimental', action="store_true", help="Allow an experimental SoC profile after reviewing its limitations")
+    parser.add_argument('--badcon', action="store_true", help="Send EUB data in 512-byte USB Bulk OUT chunks for unstable connections")
 
     args = parser.parse_args()
     allow_experimental = args.allow_experimental
+    badcon = args.badcon
 
     if args.bl_tar:
         if os.path.isfile(args.bl_tar):
@@ -340,6 +376,9 @@ def main():
 
     if args.verbose:
         verbose = True
+
+    if badcon:
+        logger.warning("Bad connection mode enabled: 512-byte USB Bulk OUT chunks; automatic retries are disabled.")
 
     logger.warning("Extracting files...")
     extract_bl_tar(args.bl_tar)

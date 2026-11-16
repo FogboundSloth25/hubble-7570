@@ -24,6 +24,8 @@
   - Install required python packages via ```pip3 install -r requirements.txt```
   - Run the tool, pointing to your bootloader tar file via ```python3 hubble.py -b <PATH_TO_BL_TAR>```
   - Experimental profiles require the explicit ```--allow-experimental``` option.
+  - Use ```--badcon``` for unstable USB links. It sends each EUB frame as consecutive 512-byte USB Bulk OUT transfers.
+  - ```--badcon``` does not retry a failed chunk: the BootROM does not provide a confirmed per-chunk resume/ack mechanism in this tool, so retrying blindly could corrupt the stream.
   - Plug in your bricked phone
   - Let it run it's magic
   - Reflash the stock firmware
@@ -94,6 +96,7 @@ https://github.com/user-attachments/assets/78ca9dda-04c2-45d3-ad47-5a713086e33e
 - The candidate split map is FWBL1 `0x00000–0x02000`, BL31 `0x02000–0x20000`, BL2 `0x20000–0x2D000`, and U-Boot `0x2D000–0xFE000`. The first two boundaries are supported by the embedded size fields and the `daeh` marker; the remaining boundaries follow the Exynos7 split detector's signature/alignment heuristic and its `0xD1000` U-Boot size.
 - The appended range `0xFE000–0x187110` is not mapped by this profile. It contains TEEgris-related strings, but its exact component boundaries and whether it is needed for EUB recovery have not been established. It is deliberately not sent.
 - `response_support` is disabled pending direct confirmation of the Exynos 7570 response protocol. No successful Hubble recovery / transition to Download Mode has been reported yet.
+- `--badcon` uses 512-byte USB Bulk OUT writes. A similar 512-byte transfer pattern is documented for Exynos 8895 BootROM; applying it to Exynos 7570 is an experimental transport workaround, not a confirmed fix for a faulty cable or port.
 - The profile is blocked by default. Review the risks before running Hubble with `--allow-experimental`.
 
 ## Credits
