@@ -78,3 +78,47 @@ Run with `--forensic` to collect frame metadata, exact DNW header/footer, SHA-25
 The default forensic mode does not read Bulk IN endpoint `0x81`, to avoid consuming unknown device messages. `--probe-in` is a separate opt-in test; it reads up to 512 bytes with a 25 ms timeout after each complete frame and can consume a pending response.
 
 If the USB device disappears after a successful chunk, forensic mode stops and records any device returning on the same physical port. It does not resume an incomplete DNW frame because per-chunk resume semantics for Exynos 7570 are unknown.
+
+
+## 2026-11-16 forensic run 22:14:18: kernel-level timing
+
+The second forensic run confirms the same failure and exposes a flaw in the first forensic presence check.
+
+### Host trace
+
+- Device `04e8:1234` was enumerated on bus 1, port path `(7,)`, USB address 11.
+- FWBL1, BL31, and BL2 DNW frames all completed. The payload SHA-256 values were recorded in the forensic log.
+- After BL2, address 11 disconnected and the same Exynos serial re-enumerated on the same port as address 12. Hubble reclaimed interface 0.
+- The U-Boot DNW frame is internally size-consistent: total frame and declared size are both `0xD100A`; the header is `1b 44 4e 57 0a 10 0d 00`; footer is `ff ff`; payload length is `0xD1000`.
+- The first U-Boot 512-byte Bulk OUT call returned success after `1.118573 s`. The second call at offset `0x200` failed with `ENODEV` after `0.001104 s`.
+
+### Kernel trace, same wall-clock time
+
+- `22:14:27.342`: xHCI enumerated a new high-speed device on `1-7`.
+- `22:14:27.469`: kernel identified it as Exynos7570 / `04e8:1234`, serial ending `...006D7`.
+- `22:14:28.634`: kernel logged `USB disconnect, device number 12`.
+- `22:14:28.879`: xHCI detected a *low-speed* device on the same port.
+- From `22:14:28.993` onward, descriptor reads failed with `-71` (USB protocol error / `EPROTO`); the controller attempted a port power cycle and still could not enumerate the device.
+
+The kernel disconnect timestamp is approximately 327 ms **before** Hubble logged the first U-Boot Bulk OUT call as successful. Therefore the host-side "write succeeded" means libusb completed that transfer from its perspective; it does not prove the device stayed connected through the completion callback.
+
+### Important diagnostic correction
+
+The first forensic USB check called `usb.core.find()` and reported the old identity as still present. The kernel log shows that result can be stale during the disconnect race. The forensic code now follows enumeration with a standard, read-only USB EP0 `GET_DESCRIPTOR` request. That checks whether the physical device actually answers, rather than trusting enumeration metadata alone.
+
+The previous same-port fallback also treated a device with `port_numbers=None` as matching the target port. This incorrectly included the xHCI root-hub controller in the "same port" report. Port-path matching is now strict; devices without the matching physical port path are excluded.
+
+### What can and cannot be concluded
+
+**Confirmed:** the device physically disconnects while the U-Boot first-block transfer is in progress; xHCI then sees a low-speed/protocol-error condition and cannot re-enumerate Exynos7570. This is not merely a Python stale-handle exception.
+
+**Not confirmed:** whether the trigger is BootROM rejection of the U-Boot frame/header, a device-side reset/watchdog, an electrical/PHY issue, or the long-held hardware key. The captured frame header and size field are self-consistent.
+
+**Size-limit hypothesis remains unproven:** the `0x4E800` receive-buffer limit is documented for Exynos8895, not Exynos7570. A published Exynos7580 recovery uses a `0xD1000` bootloader stage, which shows that this length is possible on a related but different legacy Exynos EUB implementation. Do not truncate the 7570 U-Boot based only on the Exynos8895 value.
+
+### Timing clue worth testing
+
+The kernel log contains repeated EUB connect/disconnect cycles before this run as well. In the 22:14 run, the first EUB enumeration lasted about 6.43 seconds before the post-BL2 disconnect/reconnect, then the next valid enumeration lasted about 1.16 seconds before the U-Boot-associated disconnect. Related Exynos recovery documentation explicitly warns that a long-held POWER key can reset the USB connection:
+https://github.com/ananjaser1211/exynos8890-exynos-usbdl-recovery
+
+This is a plausible confounder, not proof: the cited guide covers Exynos8890/7580 variants, not SM-G570F/Exynos7570. The exact hardware key being held and whether its long-press reset threshold applies to this board must be confirmed separately.

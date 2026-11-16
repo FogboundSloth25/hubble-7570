@@ -165,7 +165,14 @@ def _devices_on_same_port(reference_device):
     for candidate in devices:
         bus_matches = ref_bus is None or getattr(candidate, "bus", None) == ref_bus
         candidate_ports = getattr(candidate, "port_numbers", None)
-        ports_match = ref_ports is None or candidate_ports is None or candidate_ports == ref_ports
+
+        # A missing port path is not proof that a device is on the target port.
+        # In particular, the xHCI root-hub device itself often has ports=None.
+        if ref_ports is not None:
+            ports_match = candidate_ports is not None and candidate_ports == ref_ports
+        else:
+            ports_match = False
+
         if bus_matches and ports_match:
             same_port.append(candidate)
     return same_port
@@ -212,14 +219,48 @@ def forensic_watch_after_chunk(device, filename, chunk_index, offset):
         )
         if same_instance:
             logger.debug(
-                "FORENSIC USB POST-CHUNK: still present after %s chunk=%d offset=0x%X "
-                "check_time=%.6fs identity=%s",
+                "FORENSIC USB POST-CHUNK: libusb enumeration still reports the same "
+                "identity after %s chunk=%d offset=0x%X check_time=%.6fs identity=%s",
                 filename, chunk_index, offset,
                 (perf_counter_ns() - started) / 1_000_000_000, after
             )
-            return
 
-        logger.error(
+            # usb.core.find() may still return a just-disconnected device object.
+            # Issue a standard, read-only GET_DESCRIPTOR request over EP0 to prove
+            # that the physical device still answers on the bus.
+            ep0_started = perf_counter_ns()
+            try:
+                descriptor = bytes(current.ctrl_transfer(
+                    0x80,       # device-to-host, standard, device recipient
+                    0x06,       # GET_DESCRIPTOR
+                    0x0100,    # DEVICE descriptor
+                    0,
+                    18,
+                    timeout=150
+                ))
+                if len(descriptor) != 18 or descriptor[0] != 18 or descriptor[1] != 1:
+                    raise RuntimeError(
+                        f"unexpected device descriptor ({len(descriptor)} bytes): {descriptor.hex()}"
+                    )
+                logger.debug(
+                    "FORENSIC USB EP0: device answered GET_DESCRIPTOR after %s "
+                    "chunk=%d in %.6fs descriptor=%s",
+                    filename, chunk_index,
+                    (perf_counter_ns() - ep0_started) / 1_000_000_000,
+                    descriptor.hex(" ")
+                )
+                return
+            except Exception as e:
+                logger.error(
+                    "FORENSIC USB EP0: libusb enumeration still showed the device, "
+                    "but GET_DESCRIPTOR failed after %s chunk=%d: %s: %s "
+                    "(errno=%s backend_error_code=%s)",
+                    filename, chunk_index, type(e).__name__, e,
+                    getattr(e, "errno", None),
+                    getattr(e, "backend_error_code", None)
+                )
+        else:
+            logger.error(
             "FORENSIC USB POST-CHUNK: identity changed immediately after %s "
             "chunk=%d offset=0x%X before=%s after=%s",
             filename, chunk_index, offset, before, after
@@ -745,6 +786,9 @@ def send_part_to_device(device, file, filename):
                     device, filename, chunk_index, ret - written
                 )
 
+            if forensic_mode and probe_bulk_in and chunk_index == 1:
+                forensic_probe_bulk_in(device, f"after first chunk {filename}")
+
             if ret >= next_progress or ret == file_size:
                 logger.info(f"=> {ret}/{file_size} bytes transferred")
                 while next_progress <= ret:
@@ -1003,7 +1047,7 @@ def main():
     parser.add_argument('--badcon', action="store_true", help="Send EUB data in 512-byte USB Bulk OUT chunks for unstable connections")
     parser.add_argument('--debug', '--debug-usb', dest="debug_usb", action="store_true", help="Log USB descriptors, device presence, and timing/errors for every Bulk OUT transfer")
     parser.add_argument('--forensic', action="store_true", help="Enable detailed frame/USB tracing, millisecond log files, and automatic Linux dmesg capture")
-    parser.add_argument('--probe-in', action="store_true", help="With --forensic, read Bulk IN 0x81 for 25ms after each frame; may consume pending device data")
+    parser.add_argument('--probe-in', action="store_true", help="With --forensic, read Bulk IN 0x81 for 25ms after the first chunk and each complete frame; may consume pending device data")
 
     args = parser.parse_args()
     allow_experimental = args.allow_experimental
