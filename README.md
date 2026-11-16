@@ -30,6 +30,7 @@
   - Add ```--forensic``` for deeper diagnosis. It writes a millisecond-timestamped application log and, on Linux when permitted, captures an initial kernel log snapshot plus live USB events under ```logs/```. It records each DNW frame's size, header, trailer, SHA-256, prefix/suffix, and checks USB enumeration immediately after the first chunk of every stage and every 64 chunks.
   - Forensic mode does not read Bulk IN by default. ```--probe-in``` enables a 25 ms read from endpoint ```0x81``` after each complete frame; this can consume pending device data and should be used only as a separate diagnostic run.
   - The experimental Exynos7570 profile watches the BL2 → U-Boot boundary for USB re-enumeration. If the phone resets its EUB interface, Hubble reopens and reclaims the same device by USB path and serial instead of writing through the stale handle.
+- The same profile can recover from a USB disconnect in the middle of a DNW frame: it waits up to 20 seconds for the same EUB device to reappear on the same physical USB path, then retries the **entire frame from byte 0** (never resumes a partial frame), for up to 8 retries per stage. The 7-second expected cycle is based on the observed SM-G570F disconnect/reconnect timing; this recovery strategy assumes a fresh EUB enumeration resets the BootROM's DNW receive state and remains experimental until a successful recovery is confirmed.
   - Plug in your bricked phone
   - Let it run it's magic
   - Reflash the stock firmware
