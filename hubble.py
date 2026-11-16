@@ -13,7 +13,10 @@ import sys
 import os
 import coloredlogs
 import logging
-from time import sleep, monotonic
+import atexit
+import subprocess
+from datetime import datetime
+from time import sleep, monotonic, perf_counter_ns
 import re
 
 EXYNOS_DATA = None
@@ -21,10 +24,297 @@ EXYNOS_DATA = None
 soc     = ""
 logger  = logging.getLogger(__name__)
 verbose = False
+forensic_mode = False
+probe_bulk_in = False
+forensic_start_ns = None
+forensic_log_path = None
+kernel_log_process = None
+kernel_log_stream = None
+forensic_file_handler = None
 allow_experimental = False
 badcon = False
 debug_usb = False
 USB_BACKEND = None
+
+def forensic_elapsed():
+    if forensic_start_ns is None:
+        return 0.0
+    return (perf_counter_ns() - forensic_start_ns) / 1_000_000_000
+
+
+def stop_kernel_capture():
+    global kernel_log_process, kernel_log_stream
+    if kernel_log_process is not None:
+        try:
+            kernel_log_process.terminate()
+            kernel_log_process.wait(timeout=2)
+        except Exception:
+            try:
+                kernel_log_process.kill()
+            except Exception:
+                pass
+        kernel_log_process = None
+    if kernel_log_stream is not None:
+        try:
+            kernel_log_stream.flush()
+            kernel_log_stream.close()
+        except Exception:
+            pass
+        kernel_log_stream = None
+
+
+def start_forensic_capture():
+    global forensic_log_path, forensic_file_handler
+    global kernel_log_process, kernel_log_stream, forensic_start_ns
+
+    forensic_start_ns = perf_counter_ns()
+    os.makedirs("logs", exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    forensic_log_path = os.path.join("logs", f"hubble-forensic-{stamp}.log")
+    kernel_log_path = os.path.join("logs", f"hubble-dmesg-{stamp}.log")
+
+    file_handler = logging.FileHandler(forensic_log_path, encoding="utf-8")
+    file_handler.setLevel(logging.DEBUG)
+    file_handler.setFormatter(logging.Formatter(
+        "%(asctime)s.%(msecs)03d %(levelname)s [%(name)s] %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S"
+    ))
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.DEBUG)
+    root_logger.addHandler(file_handler)
+    forensic_file_handler = file_handler
+    logger.warning("FORENSIC: application log: %s", forensic_log_path)
+    logger.warning("FORENSIC: monotonic relative timestamps enabled")
+
+    if os.name == "nt":
+        logger.warning("FORENSIC: automatic dmesg capture is unavailable on Windows")
+        return
+
+    try:
+        kernel_log_stream = open(kernel_log_path, "w", encoding="utf-8")
+        snapshot = subprocess.run(
+            ["dmesg", "--time-format=iso"],
+            stdout=kernel_log_stream,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=4,
+            check=False
+        )
+        kernel_log_stream.write(
+            "\n===== LIVE KERNEL LOG (dmesg --follow --time-format=iso) =====\n"
+        )
+        kernel_log_stream.flush()
+        kernel_log_process = subprocess.Popen(
+            ["dmesg", "--follow", "--time-format=iso"],
+            stdout=kernel_log_stream,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1
+        )
+        atexit.register(stop_kernel_capture)
+        logger.warning(
+            "FORENSIC: kernel log: %s (snapshot exit=%s, follow PID=%s)",
+            kernel_log_path, snapshot.returncode, kernel_log_process.pid
+        )
+    except Exception as e:
+        logger.warning("FORENSIC: automatic dmesg capture failed: %s", e)
+        stop_kernel_capture()
+
+
+def _usb_descriptor_string(device, descriptor_index):
+    if not descriptor_index:
+        return None
+    try:
+        value = usb.util.get_string(device, descriptor_index)
+        return value.strip("\0") if value else None
+    except Exception as e:
+        return f"<unreadable: {type(e).__name__}: {e}>"
+
+
+def _usb_identity(device):
+    return {
+        "vid": getattr(device, "idVendor", None),
+        "pid": getattr(device, "idProduct", None),
+        "bus": getattr(device, "bus", None),
+        "address": getattr(device, "address", None),
+        "ports": getattr(device, "port_numbers", None),
+        "speed": getattr(device, "speed", None),
+        "manufacturer": _usb_descriptor_string(device, getattr(device, "iManufacturer", 0)),
+        "product": _usb_descriptor_string(device, getattr(device, "iProduct", 0)),
+        "serial": _usb_descriptor_string(device, getattr(device, "iSerialNumber", 0)),
+        "bcdUSB": getattr(device, "bcdUSB", None),
+        "bcdDevice": getattr(device, "bcdDevice", None),
+        "bMaxPacketSize0": getattr(device, "bMaxPacketSize0", None),
+    }
+
+
+def _devices_on_same_port(reference_device):
+    ref_bus = getattr(reference_device, "bus", None)
+    ref_ports = getattr(reference_device, "port_numbers", None)
+    try:
+        devices = list(usb.core.find(find_all=True, backend=USB_BACKEND) or [])
+    except Exception as e:
+        logger.warning("FORENSIC USB ENUMERATION: find_all failed: %s: %s", type(e).__name__, e)
+        return []
+
+    same_port = []
+    for candidate in devices:
+        bus_matches = ref_bus is None or getattr(candidate, "bus", None) == ref_bus
+        candidate_ports = getattr(candidate, "port_numbers", None)
+        ports_match = ref_ports is None or candidate_ports is None or candidate_ports == ref_ports
+        if bus_matches and ports_match:
+            same_port.append(candidate)
+    return same_port
+
+
+def forensic_report_port(reference_device, context):
+    devices = _devices_on_same_port(reference_device)
+    if not devices:
+        logger.error(
+            "FORENSIC USB [%s]: no enumerated USB device on bus=%s ports=%s",
+            context, getattr(reference_device, "bus", None),
+            getattr(reference_device, "port_numbers", None)
+        )
+        return []
+
+    for candidate in devices:
+        logger.warning("FORENSIC USB [%s]: same-port identity=%s", context, _usb_identity(candidate))
+    return devices
+
+
+def forensic_watch_after_chunk(device, filename, chunk_index, offset):
+    if not forensic_mode:
+        return
+
+    before = _usb_identity(device)
+    started = perf_counter_ns()
+    try:
+        current = usb.core.find(
+            idVendor=0x04e8, idProduct=0x1234, backend=USB_BACKEND
+        )
+    except Exception as e:
+        logger.exception(
+            "FORENSIC USB [%s chunk=%d offset=0x%X]: enumeration query failed",
+            filename, chunk_index, offset
+        )
+        raise RuntimeError(f"USB enumeration query failed after {filename} chunk {chunk_index}: {e}") from e
+
+    if current is not None:
+        after = _usb_identity(current)
+        same_instance = (
+            after["bus"] == before["bus"]
+            and after["ports"] == before["ports"]
+            and after["address"] == before["address"]
+        )
+        if same_instance:
+            logger.debug(
+                "FORENSIC USB POST-CHUNK: still present after %s chunk=%d offset=0x%X "
+                "check_time=%.6fs identity=%s",
+                filename, chunk_index, offset,
+                (perf_counter_ns() - started) / 1_000_000_000, after
+            )
+            return
+
+        logger.error(
+            "FORENSIC USB POST-CHUNK: identity changed immediately after %s "
+            "chunk=%d offset=0x%X before=%s after=%s",
+            filename, chunk_index, offset, before, after
+        )
+    else:
+        logger.error(
+            "FORENSIC USB POST-CHUNK: 04e8:1234 disappeared immediately after %s "
+            "chunk=%d offset=0x%X although Bulk OUT returned success",
+            filename, chunk_index, offset
+        )
+
+    deadline = monotonic() + 2.0
+    same_port_identities = None
+    while monotonic() < deadline:
+        candidates = _devices_on_same_port(device)
+        if candidates:
+            same_port_identities = [_usb_identity(candidate) for candidate in candidates]
+            logger.warning(
+                "FORENSIC USB POST-CHUNK: device(s) returned on the same port after "
+                "%s chunk=%d: %s",
+                filename, chunk_index, same_port_identities
+            )
+            break
+        sleep(0.02)
+
+    if same_port_identities is None:
+        logger.error(
+            "FORENSIC USB POST-CHUNK: nothing enumerated on bus=%s ports=%s "
+            "within 2.0s after %s chunk=%d",
+            before["bus"], before["ports"], filename, chunk_index
+        )
+
+    raise RuntimeError(
+        f"USB disappeared or re-enumerated immediately after successful {filename} "
+        f"chunk {chunk_index} at offset 0x{offset:X}. Captured same-port enumeration; "
+        "stopped before sending more bytes because the DNW frame cannot be resumed safely."
+    )
+
+
+def forensic_log_frame(frame, filename):
+    frame_size = len(frame)
+    declared_size = struct.unpack("<I", frame[4:8])[0] if frame_size >= 8 else None
+    payload = bytes(frame[8:-2]) if frame_size >= 10 else b""
+    payload_hash = hashlib.sha256(payload).hexdigest()
+    prefix = payload[:32].hex(" ")
+    suffix = payload[-32:].hex(" ") if payload else ""
+
+    logger.info(
+        "FORENSIC FRAME [%s]: frame_bytes=%d (0x%X) declared_size=%s header=%s trailer=%s",
+        filename, frame_size, frame_size,
+        f"{declared_size} (0x{declared_size:X})" if declared_size is not None else "invalid",
+        bytes(frame[:8]).hex(" "), bytes(frame[-2:]).hex(" ")
+    )
+    logger.info(
+        "FORENSIC FRAME [%s]: payload_bytes=%d (0x%X) SHA256=%s",
+        filename, len(payload), len(payload), payload_hash
+    )
+    logger.info(
+        "FORENSIC FRAME [%s]: payload_prefix[0:32]=%s payload_suffix[-32:]=%s",
+        filename, prefix, suffix
+    )
+
+    if declared_size != frame_size:
+        logger.error(
+            "FORENSIC FRAME [%s]: DNW size field mismatch: declared=%s actual=%d",
+            filename, declared_size, frame_size
+        )
+    if frame_size > 0x4E800:
+        logger.warning(
+            "FORENSIC SIZE HYPOTHESIS [%s]: frame 0x%X exceeds 0x4E800. "
+            "That receive limit is documented for the separately reverse-engineered "
+            "Exynos 8895 BootROM only; it is NOT established for Exynos 7570.",
+            filename, frame_size
+        )
+
+
+def forensic_probe_bulk_in(device, context):
+    if not probe_bulk_in:
+        return
+    started = perf_counter_ns()
+    try:
+        data = bytes(device.read(0x81, 512, timeout=25))
+        logger.warning(
+            "FORENSIC BULK IN [%s]: received=%d bytes elapsed=%.6fs hex=%s ascii=%r",
+            context, len(data),
+            (perf_counter_ns() - started) / 1_000_000_000,
+            data.hex(" "), data.decode("ascii", errors="replace")
+        )
+    except usb.core.USBTimeoutError:
+        logger.info("FORENSIC BULK IN [%s]: no data on endpoint 0x81 within 25ms", context)
+    except Exception as e:
+        logger.warning(
+            "FORENSIC BULK IN [%s]: read failed after %.6fs: %s: %s "
+            "(errno=%s backend_error_code=%s)",
+            context, (perf_counter_ns() - started) / 1_000_000_000,
+            type(e).__name__, e,
+            getattr(e, "errno", None), getattr(e, "backend_error_code", None)
+        )
+
 
 def write_u32(value):
     return struct.pack('<I', value)
@@ -364,6 +654,13 @@ def send_part_to_device(device, file, filename):
     write_header(file, file_size)
     append_checksum(file)
 
+    if forensic_mode:
+        forensic_log_frame(file, filename)
+        logger.info(
+            "FORENSIC STAGE [%s]: transmission starts at relative t+%.6fs",
+            filename, forensic_elapsed()
+        )
+
     if badcon:
         # Keep the EUB frame intact, but split its USB Bulk OUT stream into
         # small transfers. 512 bytes matches a documented Exynos BootROM
@@ -378,11 +675,13 @@ def send_part_to_device(device, file, filename):
 
             chunk_index = (ret // chunk_size) + 1
             transfer_started = monotonic()
+            transfer_started_ns = perf_counter_ns()
 
             if debug_usb:
                 logger.debug(
-                    "USB DEBUG: OUT BEGIN file=%s chunk=%d offset=0x%X size=%d timeout=50000ms",
-                    filename, chunk_index, ret, len(chunk)
+                    "USB DEBUG: OUT BEGIN file=%s chunk=%d offset=0x%X size=%d "
+                    "timeout=50000ms relative_t=%.6fs",
+                    filename, chunk_index, ret, len(chunk), forensic_elapsed()
                 )
 
             try:
@@ -392,7 +691,7 @@ def send_part_to_device(device, file, filename):
                 if debug_usb:
                     logger.exception(
                         "USB DEBUG: OUT FAILED file=%s chunk=%d offset=0x%X "
-                        "chunk_size=%d total=%d elapsed=%.3fs errno=%s "
+                        "chunk_size=%d total=%d elapsed=%.6fs elapsed_ns=%d errno=%s "
                         "backend_error_code=%s args=%r",
                         filename,
                         chunk_index,
@@ -400,12 +699,17 @@ def send_part_to_device(device, file, filename):
                         len(chunk),
                         file_size,
                         elapsed,
+                        perf_counter_ns() - transfer_started_ns,
                         getattr(e, "errno", None),
                         getattr(e, "backend_error_code", None),
                         getattr(e, "args", None),
                     )
                     debug_usb_presence(device, f"write failure in {filename}")
                     debug_usb_state(device, f"write failure in {filename}")
+                    if forensic_mode:
+                        forensic_report_port(
+                            device, f"write failure in {filename} chunk={chunk_index}"
+                        )
                 raise RuntimeError(
                     f"USB write failed for {filename} at offset 0x{ret:X} "
                     f"({ret}/{file_size} bytes, chunk {chunk_index}, "
@@ -413,11 +717,13 @@ def send_part_to_device(device, file, filename):
                 ) from e
 
             elapsed = monotonic() - transfer_started
+            elapsed_ns = perf_counter_ns() - transfer_started_ns
             if debug_usb:
                 logger.debug(
                     "USB DEBUG: OUT OK file=%s chunk=%d offset=0x%X "
-                    "size=%d elapsed=%.3fs",
-                    filename, chunk_index, ret, written, elapsed
+                    "size=%d elapsed=%.6fs elapsed_ns=%d relative_t=%.6fs",
+                    filename, chunk_index, ret, written, elapsed, elapsed_ns,
+                    forensic_elapsed()
                 )
 
             if written != len(chunk):
@@ -427,6 +733,13 @@ def send_part_to_device(device, file, filename):
                 )
 
             ret += written
+
+            if forensic_mode and (
+                chunk_index == 1 or (chunk_index % 64 == 0 and ret < file_size)
+            ):
+                forensic_watch_after_chunk(
+                    device, filename, chunk_index, ret - written
+                )
 
             if ret >= next_progress or ret == file_size:
                 logger.info(f"=> {ret}/{file_size} bytes transferred")
@@ -462,6 +775,9 @@ def send_part_to_device(device, file, filename):
                 "USB DEBUG: OUT OK file=%s bytes=%d elapsed=%.3fs",
                 filename, ret, monotonic() - transfer_started
             )
+
+    if forensic_mode and probe_bulk_in:
+        forensic_probe_bulk_in(device, f"after complete frame {filename}")
 
     if EXYNOS_DATA["response_support"] == True and verbose == True:
         while True:
@@ -640,10 +956,11 @@ def validate_sboot_image(path):
 
 def main():
     global verbose, allow_experimental, badcon, debug_usb
+    global forensic_mode, probe_bulk_in
 
     coloredlogs.install(
         level="DEBUG",
-        fmt="%(asctime)s %(message)s",
+        fmt="%(asctime)s.%(msecs)03d %(message)s",
         level_styles={
             'debug': {'color': 'magenta'},
             'info': {'color': 'green'},
@@ -681,11 +998,18 @@ def main():
     parser.add_argument('--allow-experimental', action="store_true", help="Allow an experimental SoC profile after reviewing its limitations")
     parser.add_argument('--badcon', action="store_true", help="Send EUB data in 512-byte USB Bulk OUT chunks for unstable connections")
     parser.add_argument('--debug', '--debug-usb', dest="debug_usb", action="store_true", help="Log USB descriptors, device presence, and timing/errors for every Bulk OUT transfer")
+    parser.add_argument('--forensic', action="store_true", help="Enable detailed frame/USB tracing, millisecond log files, and automatic Linux dmesg capture")
+    parser.add_argument('--probe-in', action="store_true", help="With --forensic, read Bulk IN 0x81 for 25ms after each frame; may consume pending device data")
 
     args = parser.parse_args()
     allow_experimental = args.allow_experimental
     badcon = args.badcon
-    debug_usb = args.debug_usb
+    debug_usb = args.debug_usb or args.forensic or args.probe_in
+    forensic_mode = args.forensic or args.probe_in
+    probe_bulk_in = args.probe_in
+
+    if forensic_mode:
+        start_forensic_capture()
 
     if args.bl_tar:
         if os.path.isfile(args.bl_tar):
@@ -702,6 +1026,17 @@ def main():
 
     if debug_usb:
         logger.warning("USB debug mode enabled: descriptors, enumeration, and Bulk OUT transfer timing will be logged.")
+
+    if forensic_mode:
+        logger.warning(
+            "FORENSIC mode enabled: DNW frame hashes, precise timing, post-chunk USB checks, "
+            "same-port device scans, and automatic kernel log capture are enabled."
+        )
+        if probe_bulk_in:
+            logger.warning(
+                "FORENSIC Bulk IN probing is enabled; reads from 0x81 can consume pending "
+                "device messages. Compare with a run without --probe-in."
+            )
 
     logger.warning("Extracting files...")
     extract_bl_tar(args.bl_tar)

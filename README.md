@@ -27,6 +27,8 @@
   - Use ```--badcon``` for unstable USB links. It sends each EUB frame as consecutive 512-byte USB Bulk OUT transfers.
   - ```--badcon``` does not retry a failed chunk: the BootROM does not provide a confirmed per-chunk resume/ack mechanism in this tool, so retrying blindly could corrupt the stream.
   - Add ```--debug``` (or ```--debug-usb```) to log USB endpoint descriptors, enumeration state, and the start/result/duration of every Bulk OUT write. On Linux, also capture ```sudo dmesg -w``` in a second terminal.
+  - Add ```--forensic``` for deeper diagnosis. It writes a millisecond-timestamped application log and, on Linux when permitted, captures an initial kernel log snapshot plus live USB events under ```logs/```. It records each DNW frame's size, header, trailer, SHA-256, prefix/suffix, and checks USB enumeration immediately after the first chunk of every stage and every 64 chunks.
+  - Forensic mode does not read Bulk IN by default. ```--probe-in``` enables a 25 ms read from endpoint ```0x81``` after each complete frame; this can consume pending device data and should be used only as a separate diagnostic run.
   - The experimental Exynos7570 profile watches the BL2 → U-Boot boundary for USB re-enumeration. If the phone resets its EUB interface, Hubble reopens and reclaims the same device by USB path and serial instead of writing through the stale handle.
   - Plug in your bricked phone
   - Let it run it's magic

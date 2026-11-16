@@ -48,3 +48,33 @@ After successfully sending `bl2.bin`, Hubble now watches for up to 10 seconds fo
 If no re-enumeration occurs and the original connection remains present, Hubble continues with the original handle. If the device disappears and does not return as the same EUB device, Hubble stops rather than writing to a stale handle.
 
 This behavior is inferred from the user's captured trace and remains unverified on hardware. It is not a claim that the recovery is now confirmed.
+
+
+## 2026-11-16 follow-up trace: disconnect after first U-Boot chunk
+
+A later run using the profile-specific BL2 transition handling produced a more precise failure:
+
+1. FWBL1, BL31, and BL2 were fully transferred.
+2. After BL2, the EUB device disappeared and returned as `04e8:1234` on the same bus/port path `(7,)` with a new USB address. Hubble reclaimed interface 0 successfully.
+3. U-Boot transmission began on the new handle.
+4. U-Boot chunk 1 (512 bytes at offset `0x000`) returned success after approximately 1.131 seconds.
+5. U-Boot chunk 2 (offset `0x200`) failed with `ENODEV` after approximately 0.002 seconds. The device was no longer enumerated.
+
+This confirms that the BL2 reconnect handler is working. The current failure occurs inside the U-Boot DNW frame, immediately after its first 512-byte Bulk OUT transfer.
+
+### Leading hypothesis to test: DNW frame-size limit
+
+The U-Boot frame is `0xD100A` bytes including the 8-byte DNW header and 2-byte footer. A published reverse-engineering analysis of the Exynos 8895 BootROM describes a receive buffer of `0x4E800` bytes and a corresponding frame-size check. Exynos 7570 has not been proven to share this limit; this is **not** a conclusion. However, the DNW size field is in the first 8 bytes, so rejection immediately after the first block is consistent with a size-validation/reset hypothesis.
+
+Source: https://fredericb.info/2020/06/reverse-engineer-usb-stack-of-exynos-bootrom.html
+
+The Exynos 7580 recovery project uses a `0xD1000` bootloader file, which shows that a similarly sized stage can work on at least one nearby legacy Exynos EUB implementation. It does not prove identical receive-buffer or protocol behavior on Exynos 7570:
+https://github.com/MrSmoer/exynos7580-exynos-usbdl-recovery
+
+### Forensic mode
+
+Run with `--forensic` to collect frame metadata, exact DNW header/footer, SHA-256, first/last 32 payload bytes, millisecond timestamps, monotonic relative timings, immediate USB checks after the first chunk and periodic checkpoints, same-port re-enumeration scans, plus an initial `dmesg` snapshot and live kernel USB log when permitted.
+
+The default forensic mode does not read Bulk IN endpoint `0x81`, to avoid consuming unknown device messages. `--probe-in` is a separate opt-in test; it reads up to 512 bytes with a 25 ms timeout after each complete frame and can consume a pending response.
+
+If the USB device disappears after a successful chunk, forensic mode stops and records any device returning on the same physical port. It does not resume an incomplete DNW frame because per-chunk resume semantics for Exynos 7570 are unknown.
