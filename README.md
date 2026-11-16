@@ -23,6 +23,7 @@
 
   - Install required python packages via ```pip3 install -r requirements.txt```
   - Run the tool, pointing to your bootloader tar file via ```python3 hubble.py -b <PATH_TO_BL_TAR>```
+  - Experimental profiles require the explicit ```--allow-experimental``` option.
   - Plug in your bricked phone
   - Let it run it's magic
   - Reflash the stock firmware
@@ -37,6 +38,7 @@ https://github.com/user-attachments/assets/78ca9dda-04c2-45d3-ad47-5a713086e33e
 |:------:|:------------:|
 | ✅     | Working     |
 | ❌     | Not Working |
+| 🧪     | Experimental; successful recovery not yet confirmed |
 
 ### Exynos 9830 Devices
 
@@ -78,6 +80,21 @@ https://github.com/user-attachments/assets/78ca9dda-04c2-45d3-ad47-5a713086e33e
 | Name             | Codename   | Tested Firmware | Tested by                                       | State |
 |:-----------------|:-----------|:---------------:|:------------------------------------------------|:-----:|
 | Galaxy A5 (2016) | a5xelte    | `A510FXXS8CTI7` | [Daniel224455](https://github.com/Daniel224455) | ✅    |
+
+### Exynos 7570 Devices
+
+| Name           | Codename | Tested Firmware | Profile Contributor | State |
+|:---------------|:---------|:---------------:|:-------------------:|:-----:|
+| Galaxy J5 Prime (SM-G570F) | on5xelte | `G570FXXS4CTJ8` | FogboundSloth25 (layout only) | 🧪 |
+
+**Experimental profile notes:**
+
+- USB EUB enumeration was confirmed on an SM-G570F: VID:PID `04e8:1234`, `iProduct` `Exynos7570`, `iInterface` `USB Booting v0.5`, interface 0, Bulk OUT `0x02`, Bulk IN `0x81`.
+- The profile was derived from `G570FXXS4CTJ8`; its extracted `sboot.bin` SHA-256 is `505b9b9e8192b9fa4ee4bb2229e7934327444a47c408eaa6b300facb1c629841`. The tool pins this hash and refuses a different S-Boot image for this experimental profile.
+- The candidate split map is FWBL1 `0x00000–0x02000`, BL31 `0x02000–0x20000`, BL2 `0x20000–0x2D000`, and U-Boot `0x2D000–0xFE000`. The first two boundaries are supported by the embedded size fields and the `daeh` marker; the remaining boundaries follow the Exynos7 split detector's signature/alignment heuristic and its `0xD1000` U-Boot size.
+- The appended range `0xFE000–0x187110` is not mapped by this profile. It contains TEEgris-related strings, but its exact component boundaries and whether it is needed for EUB recovery have not been established. It is deliberately not sent.
+- `response_support` is disabled pending direct confirmation of the Exynos 7570 response protocol. No successful Hubble recovery / transition to Download Mode has been reported yet.
+- The profile is blocked by default. Review the risks before running Hubble with `--allow-experimental`.
 
 ## Credits
 

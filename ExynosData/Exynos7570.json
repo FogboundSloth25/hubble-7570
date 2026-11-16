@@ -1,0 +1,24 @@
+{
+    "experimental": true,
+    "sboot_sha256": "505b9b9e8192b9fa4ee4bb2229e7934327444a47c408eaa6b300facb1c629841",
+    "response_support": false,
+    "files_to_send": [],
+    "bootloader_splits": {
+        "fwbl1.bin": {
+            "start": 0,
+            "length": 8192
+        },
+        "bl31.bin": {
+            "start": 8192,
+            "length": 122880
+        },
+        "bl2.bin": {
+            "start": 131072,
+            "length": 53248
+        },
+        "u-boot.bin": {
+            "start": 184320,
+            "length": 856064
+        }
+    }
+}

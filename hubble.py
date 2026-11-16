@@ -1,4 +1,5 @@
 import json
+import hashlib
 import shutil
 import usb.core
 import usb.util
@@ -20,6 +21,7 @@ EXYNOS_DATA = None
 soc     = ""
 logger  = logging.getLogger(__name__)
 verbose = False
+allow_experimental = False
 
 def write_u32(value):
     return struct.pack('<I', value)
@@ -236,8 +238,56 @@ def display_and_verify_device_info(device):
         logger.critical("This SoC is not Supported!")
         sys.exit(-1)
 
+    if EXYNOS_DATA.get("experimental", False):
+        if not allow_experimental:
+            logger.critical(
+                "This SoC profile is experimental and is blocked by default. "
+                "Review the profile, then rerun with --allow-experimental to proceed."
+            )
+            sys.exit(-1)
+        logger.warning("Experimental SoC profile enabled; S-Boot hash will be checked before transfer.")
+
+def validate_sboot_image(path):
+    try:
+        with open(path, "rb") as sboot:
+            sboot_data = sboot.read()
+    except OSError as e:
+        logger.critical(f"Could not read S-Boot image: {e}")
+        sys.exit(-1)
+
+    if EXYNOS_DATA.get("experimental", False):
+        expected_hash = EXYNOS_DATA.get("sboot_sha256")
+        if not expected_hash:
+            logger.critical("Experimental profile has no pinned S-Boot SHA-256; refusing to continue.")
+            sys.exit(-1)
+
+        actual_hash = hashlib.sha256(sboot_data).hexdigest()
+        if actual_hash.lower() != expected_hash.lower():
+            logger.critical("S-Boot image does not match the image used to derive this experimental profile.")
+            logger.critical(f"Expected SHA-256: {expected_hash}")
+            logger.critical(f"Actual SHA-256:   {actual_hash}")
+            sys.exit(-1)
+
+        logger.info(f"Experimental S-Boot SHA-256 verified: {actual_hash}")
+
+    for image_name, split in EXYNOS_DATA["bootloader_splits"].items():
+        start = split.get("start")
+        length = split.get("length")
+        if not isinstance(start, int) or not isinstance(length, int):
+            logger.critical(f"Invalid split metadata for {image_name}: start/length must be integers.")
+            sys.exit(-1)
+        if start < 0 or length <= 0 or start + length > len(sboot_data):
+            logger.critical(
+                f"Split {image_name} is outside S-Boot bounds: "
+                f"start=0x{start:X}, length=0x{length:X}, image=0x{len(sboot_data):X}"
+            )
+            sys.exit(-1)
+
+    logger.info(f"Validated {len(EXYNOS_DATA['bootloader_splits'])} bootloader split(s) against S-Boot size 0x{len(sboot_data):X}.")
+
+
 def main():
-    global verbose
+    global verbose, allow_experimental
 
     coloredlogs.install(
         level="DEBUG",
@@ -276,8 +326,10 @@ def main():
     parser = argparse.ArgumentParser(description="USB Recovery Tool for Exynos devices.")
     parser.add_argument('-b', '--bl-tar', type=str, help="Path to the .tar or .tar.md5 file", required=True)
     parser.add_argument('-v', '--verbose', action="store_true", help="Enables more Logs during Operation")
+    parser.add_argument('--allow-experimental', action="store_true", help="Allow an experimental SoC profile after reviewing its limitations")
 
     args = parser.parse_args()
+    allow_experimental = args.allow_experimental
 
     if args.bl_tar:
         if os.path.isfile(args.bl_tar):
@@ -297,6 +349,7 @@ def main():
     logger.warning("Found device.")
 
     display_and_verify_device_info(device)
+    validate_sboot_image("output/sboot.bin")
 
     logger.warning(f"Starting USB booting...")
     print()
