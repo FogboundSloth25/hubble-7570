@@ -890,8 +890,9 @@ def send_part_to_device(device, file, filename):
         logger.info(f"=> {ret} bytes written.")
     else:
         logger.critical(f"=> {ret} bytes written.")
-        logger.critical(f"Failed to write {file_size} bytes")
-        sys.exit(-1)
+        raise USBStreamInterrupted(
+            f"Short USB frame write for {filename}: {ret} of {file_size} bytes."
+        )
 
     print()
 
@@ -1133,7 +1134,7 @@ def main():
         verbose = True
 
     if badcon:
-        logger.warning("Bad connection mode enabled: 512-byte USB Bulk OUT chunks; automatic retries are disabled.")
+        logger.warning("Bad connection mode enabled: 512-byte USB Bulk OUT chunks; partial chunks are never resumed. Exynos 7570 may retry a whole frame only after a fresh EUB re-enumeration.")
 
     if debug_usb:
         logger.warning("USB debug mode enabled: descriptors, enumeration, and Bulk OUT transfer timing will be logged.")
