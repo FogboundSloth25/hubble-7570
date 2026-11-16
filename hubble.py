@@ -192,7 +192,7 @@ def _read_usb_string(device, descriptor_index):
         return None
     try:
         value = usb.util.get_string(device, descriptor_index)
-        return value.strip("\\0") if value else None
+        return value.strip("\0") if value else None
     except Exception:
         return None
 
