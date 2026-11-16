@@ -541,9 +541,11 @@ def _same_usb_path(device, bus, ports):
     device_bus = getattr(device, "bus", None)
     device_ports = getattr(device, "port_numbers", None)
 
-    if bus is not None and device_bus is not None and device_bus != bus:
+    # A missing locator is not a match. The fast Exynos 7570 transition path
+    # relies on the exact physical bus/port remaining the same.
+    if bus is not None and device_bus != bus:
         return False
-    if ports is not None and device_ports is not None and device_ports != ports:
+    if ports is not None and device_ports != ports:
         return False
     return True
 
@@ -637,7 +639,8 @@ def wait_for_stage_reenumeration(device, stage, force=False):
             stage, timeout, old_bus, old_ports, old_address, old_serial
         )
 
-    deadline = monotonic() + timeout
+    wait_started = monotonic()
+    deadline = wait_started + timeout
     saw_disconnect = False
     old_handle_disposed = False
 
@@ -676,6 +679,11 @@ def wait_for_stage_reenumeration(device, stage, force=False):
             continue
 
         if fast_reconnect:
+            logger.warning(
+                "USB fast transition after %s: found same-path Exynos at address=%s "
+                "after %.3fs; skipping product/serial string requests",
+                stage, current_address, monotonic() - wait_started
+            )
             current_product = None
             current_serial = None
         else:
@@ -702,6 +710,7 @@ def wait_for_stage_reenumeration(device, stage, force=False):
             _dispose_usb_handle(device, stage, fast=fast_reconnect)
             old_handle_disposed = True
 
+        claim_started = monotonic()
         try:
             _claim_usb_handle(current, f"re-enumerated after {stage}", fast=fast_reconnect)
         except Exception as e:
@@ -711,12 +720,15 @@ def wait_for_stage_reenumeration(device, stage, force=False):
             ) from e
 
         logger.warning(
-            "USB transition after %s: reclaimed Exynos at bus=%s ports=%s address=%s serial=%s",
+            "USB transition after %s: reclaimed Exynos at bus=%s ports=%s address=%s "
+            "serial=%s claim_time=%.3fs total_wait=%.3fs",
             stage,
             getattr(current, "bus", None),
             getattr(current, "port_numbers", None),
             getattr(current, "address", None),
-            current_serial if current_serial is not None else "<not-read-fast-path>"
+            current_serial if current_serial is not None else "<not-read-fast-path>",
+            monotonic() - claim_started,
+            monotonic() - wait_started
         )
         return current
 
@@ -1176,7 +1188,10 @@ def main():
         verbose = True
 
     if badcon:
-        logger.warning("Bad connection mode enabled: 512-byte USB Bulk OUT chunks; partial chunks are never resumed. Exynos 7570 may retry a whole frame only after a fresh EUB re-enumeration.")
+        logger.warning(
+            "Bad connection mode enabled: 512-byte USB Bulk OUT submissions for normal stages. "
+            "The Exynos 7570 profile overrides this for U-Boot and uses one bulk request."
+        )
 
     if debug_usb:
         logger.warning("USB debug mode enabled: descriptors, enumeration, and Bulk OUT transfer timing will be logged.")
