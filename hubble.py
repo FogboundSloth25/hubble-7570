@@ -589,8 +589,9 @@ def wait_for_stage_reenumeration(device, stage, force=False):
 
     Some older Exynos EUB implementations re-enumerate between boot stages.
     When that happens, the previous PyUSB handle is stale; find and claim the
-    same device again by physical USB path and serial number. If no disconnect
-    happens within the configured window, keep using the original handle.
+    same device again by bus and physical port path. Profiles may opt into a
+    fast path that skips string/configuration descriptor reads on the short
+    BL2-to-next-stage reconnect.
     """
     transitions = EXYNOS_DATA.get("stage_transitions", {})
     if force:
