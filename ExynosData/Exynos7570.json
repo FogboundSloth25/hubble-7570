@@ -40,5 +40,5 @@
         "poll_ms": 25,
         "max_stage_retries": 0
     },
-    "inter_stage_delay_ms": 0
+    "inter_stage_delay_ms": 100
 }
