@@ -228,6 +228,7 @@ def _claim_usb_handle(device, stage):
         except Exception as e:
             logger.debug("USB transition [%s]: kernel-driver detach check: %s", stage, e)
 
+    device.get_active_configuration()
     usb.util.claim_interface(device, 0)
     debug_usb_state(device, stage)
     return device
@@ -743,6 +744,10 @@ def main():
                     sys.exit(-1)
 
                 send_part_to_device(device, sboot_section, img_name)
+                stage_delay_ms = int(EXYNOS_DATA.get("inter_stage_delay_ms", 0))
+                if stage_delay_ms > 0:
+                    logger.debug("Waiting %d ms before the next boot stage...", stage_delay_ms)
+                    sleep(stage_delay_ms / 1000.0)
                 device = wait_for_stage_reenumeration(device, img_name)
                 debug_usb_presence(device, f"after {img_name}")
                 debug_usb_state(device, f"after {img_name}")

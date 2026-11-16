@@ -26,5 +26,6 @@
             "timeout_ms": 10000,
             "poll_ms": 25
         }
-    }
+    },
+    "inter_stage_delay_ms": 100
 }
