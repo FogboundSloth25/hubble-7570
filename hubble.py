@@ -23,6 +23,8 @@ logger  = logging.getLogger(__name__)
 verbose = False
 allow_experimental = False
 badcon = False
+debug_usb = False
+USB_BACKEND = None
 
 def write_u32(value):
     return struct.pack('<I', value)
@@ -54,14 +56,15 @@ def append_checksum(data):
     data[-2:] = struct.pack('<H', 0xFFFF)
 
 def find_device():
-    usb_backend = None
+    global USB_BACKEND
+    USB_BACKEND = None
     device_connection_attempts = 0
 
     if os.name == "nt":
-        usb_backend = usb.backend.libusb1.get_backend(find_library=lambda x: libusb.dll._name)
+        USB_BACKEND = usb.backend.libusb1.get_backend(find_library=lambda x: libusb.dll._name)
 
     while True:
-        device = usb.core.find(idVendor=0x04e8, idProduct=0x1234, backend=usb_backend)
+        device = usb.core.find(idVendor=0x04e8, idProduct=0x1234, backend=USB_BACKEND)
 
         if device is None:
             if device_connection_attempts == 15:
@@ -102,6 +105,88 @@ def print_crash_info(crash_str):
     logger.critical(f"Status Registers: {status_reg0}, {status_reg1}")
 
 
+def debug_usb_state(device, stage):
+    if not debug_usb:
+        return
+
+    try:
+        ports = getattr(device, "port_numbers", None)
+        logger.debug(
+            "USB DEBUG [%s]: VID:PID=%04x:%04x bus=%s address=%s ports=%s speed=%s",
+            stage,
+            device.idVendor,
+            device.idProduct,
+            getattr(device, "bus", None),
+            getattr(device, "address", None),
+            ports,
+            getattr(device, "speed", None),
+        )
+        config = device.get_active_configuration()
+        for interface in config:
+            for endpoint in interface:
+                logger.debug(
+                    "USB DEBUG [%s]: interface=%s endpoint=0x%02x direction=%s "
+                    "attributes=0x%02x max_packet=%s",
+                    stage,
+                    interface.bInterfaceNumber,
+                    endpoint.bEndpointAddress,
+                    "IN" if usb.util.endpoint_direction(endpoint.bEndpointAddress) == usb.util.ENDPOINT_IN else "OUT",
+                    endpoint.bmAttributes,
+                    endpoint.wMaxPacketSize,
+                )
+    except Exception:
+        logger.exception("USB DEBUG [%s]: unable to read current USB device state", stage)
+
+
+def debug_usb_presence(device, stage):
+    if not debug_usb:
+        return True
+
+    try:
+        current = usb.core.find(
+            idVendor=0x04e8,
+            idProduct=0x1234,
+            backend=USB_BACKEND,
+        )
+    except Exception:
+        logger.exception("USB DEBUG [%s]: enumeration check failed", stage)
+        return False
+
+    if current is None:
+        logger.error(
+            "USB DEBUG [%s]: Exynos 7570 (04e8:1234) is NO LONGER ENUMERATED",
+            stage,
+        )
+        return False
+
+    old_bus = getattr(device, "bus", None)
+    old_ports = getattr(device, "port_numbers", None)
+    new_bus = getattr(current, "bus", None)
+    new_ports = getattr(current, "port_numbers", None)
+    new_address = getattr(current, "address", None)
+
+    logger.debug(
+        "USB DEBUG [%s]: device still enumerated at bus=%s address=%s ports=%s",
+        stage, new_bus, new_address, new_ports
+    )
+
+    if old_bus is not None and new_bus != old_bus:
+        logger.error("USB DEBUG [%s]: device appeared on a different USB bus", stage)
+        return False
+    if old_ports is not None and new_ports is not None and new_ports != old_ports:
+        logger.error("USB DEBUG [%s]: device appeared on a different USB port path", stage)
+        return False
+    if new_address != getattr(device, "address", None):
+        logger.error(
+            "USB DEBUG [%s]: USB address changed from %s to %s; device re-enumerated "
+            "and the old PyUSB handle must not be reused",
+            stage, getattr(device, "address", None), new_address
+        )
+        return False
+
+    return True
+
+
 def send_part_to_device(device, file, filename):
     file_size = len(file)
 
@@ -125,6 +210,19 @@ def send_part_to_device(device, file, filename):
             try:
                 written = device.write(2, chunk, timeout=50000)
             except Exception as e:
+                if debug_usb:
+                    logger.exception(
+                        "USB DEBUG: Bulk OUT failed: file=%s offset=0x%X "
+                        "chunk=%s total=%s errno=%s backend_error_code=%s",
+                        filename,
+                        ret,
+                        len(chunk),
+                        file_size,
+                        getattr(e, "errno", None),
+                        getattr(e, "backend_error_code", None),
+                    )
+                    debug_usb_presence(device, f"write failure in {filename}")
+                    debug_usb_state(device, f"write failure in {filename}")
                 raise RuntimeError(
                     f"USB write failed for {filename} at offset 0x{ret:X} "
                     f"({ret}/{file_size} bytes). The stream cannot be resumed safely: {e}"
@@ -143,7 +241,20 @@ def send_part_to_device(device, file, filename):
                 while next_progress <= ret:
                     next_progress += 128 * 1024
     else:
-        ret = device.write(2, file, timeout=50000)
+        try:
+            ret = device.write(2, file, timeout=50000)
+        except Exception as e:
+            if debug_usb:
+                logger.exception(
+                    "USB DEBUG: Bulk OUT failed: file=%s bytes=%s errno=%s backend_error_code=%s",
+                    filename,
+                    file_size,
+                    getattr(e, "errno", None),
+                    getattr(e, "backend_error_code", None),
+                )
+                debug_usb_presence(device, f"write failure in {filename}")
+                debug_usb_state(device, f"write failure in {filename}")
+            raise
 
     if EXYNOS_DATA["response_support"] == True and verbose == True:
         while True:
@@ -321,7 +432,7 @@ def validate_sboot_image(path):
 
 
 def main():
-    global verbose, allow_experimental, badcon
+    global verbose, allow_experimental, badcon, debug_usb
 
     coloredlogs.install(
         level="DEBUG",
@@ -362,10 +473,12 @@ def main():
     parser.add_argument('-v', '--verbose', action="store_true", help="Enables more Logs during Operation")
     parser.add_argument('--allow-experimental', action="store_true", help="Allow an experimental SoC profile after reviewing its limitations")
     parser.add_argument('--badcon', action="store_true", help="Send EUB data in 512-byte USB Bulk OUT chunks for unstable connections")
+    parser.add_argument('--debug-usb', action="store_true", help="Log USB descriptors and check whether the Exynos device disconnects between EUB stages")
 
     args = parser.parse_args()
     allow_experimental = args.allow_experimental
     badcon = args.badcon
+    debug_usb = args.debug_usb
 
     if args.bl_tar:
         if os.path.isfile(args.bl_tar):
@@ -380,12 +493,17 @@ def main():
     if badcon:
         logger.warning("Bad connection mode enabled: 512-byte USB Bulk OUT chunks; automatic retries are disabled.")
 
+    if debug_usb:
+        logger.warning("USB debug mode enabled: device presence and endpoint state will be checked around every EUB stage.")
+
     logger.warning("Extracting files...")
     extract_bl_tar(args.bl_tar)
 
     logger.warning("Waiting for device")
     device = find_device()
     logger.warning("Found device.")
+    debug_usb_state(device, "device found")
+    debug_usb_presence(device, "device found")
 
     display_and_verify_device_info(device)
     validate_sboot_image("output/sboot.bin")
@@ -398,10 +516,17 @@ def main():
             device.detach_kernel_driver(0)
 
     usb.util.claim_interface(device, 0)
+    debug_usb_state(device, "interface 0 claimed")
 
     with open("output/sboot.bin", "rb") as sboot:
         for img_name, split_params in EXYNOS_DATA["bootloader_splits"].items():
             try:
+                if debug_usb and not debug_usb_presence(device, f"before {img_name}"):
+                    raise RuntimeError(
+                        f"USB device disappeared or re-enumerated before {img_name}; "
+                        "check the previous EUB stage and kernel USB log."
+                    )
+                debug_usb_state(device, f"before {img_name}")
                 logger.debug(f"Sending file part {img_name} (0x{split_params["start"]:X} - 0x{split_params["start"] + split_params["length"]:X})...")
 
                 sboot.seek(split_params["start"])
@@ -412,6 +537,8 @@ def main():
                     sys.exit(-1)
 
                 send_part_to_device(device, sboot_section, img_name)
+                debug_usb_presence(device, f"after {img_name}")
+                debug_usb_state(device, f"after {img_name}")
             except Exception as e:
                 logger.critical(f"Error when trying to process sboot.bin! ({e})")
                 sys.exit(-1)
