@@ -272,3 +272,5 @@ if java_path.is_file():
     java_path.write_text(java, encoding="utf-8")
 
 print("Applied: validated EUB endpoints, logged usbfs capabilities, retained BL31/BL2 reconnect fixes, and one async URB for U-Boot.")
+
+# Keep this PR diff focused on exercising the APK build workflow.
