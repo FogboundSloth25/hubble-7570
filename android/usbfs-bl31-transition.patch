@@ -9,7 +9,7 @@
      elapsed := time.Since(started)
      if err != nil {
          return fmt.Errorf("OUT FAILED stage=%s after=%s transferred_reported=%d: %w; frame NOT retried", filename, elapsed, n, err)
-@@ -205,6 +205,44 @@
+@@ -205,6 +205,50 @@
      return usbDevice{}, fmt.Errorf("EUB did not return on sysfs port %s within %s", old.Name, timeout)
  }
  
@@ -60,7 +60,7 @@
  func run(framesDir string) error {
      logf("root USBFS transport starting; looking for Samsung Exynos7570 EUB 04e8:1234")
      d, err := findInitial(15*time.Second)
-@@ -219,7 +257,32 @@
+@@ -219,7 +263,33 @@
              releaseAndClose(f)
              return err
          }
@@ -82,23 +82,46 @@
 +                releaseAndClose(f)
 +                return err
 +            }
-+            if changed {
-+                releaseAndClose(f)
-+                f = nil
-+                d = next
-+                f, err = openAndClaim(d)
-+                if err != nil { return fmt.Errorf("EUB re-enumerated after BL31 but interface claim failed: %w", err) }
-+                logf("interface 0 reclaimed after BL31; ready for BL2")
-+            }
++            // Reopen the usbfs node even when devnum did not change. Linux may
++            // reuse the same devnum after a fast reset, while the old fd still
++            // refers to the shut-down endpoint instance.
++            releaseAndClose(f)
++            f = nil
++            d = next
++            f, err = openAndClaim(d)
++            if err != nil { return fmt.Errorf("USBFS interface could not be reclaimed after BL31 (reenumerated=%t): %w", changed, err) }
++            logf("USBFS interface 0 reopened after BL31; ready for BL2 (reenumerated=%t)", changed)
 +        } else if stage == "bl2.dnw" {
-             releaseAndClose(f)
-             f = nil
-             next, err := waitForSamePort(d, 10*time.Second)
-@@ -228,8 +291,6 @@
-             f, err = openAndClaim(d)
-             if err != nil { return fmt.Errorf("re-enumerated EUB found but interface claim failed: %w", err) }
-             logf("interface 0 reclaimed; ready for U-Boot")
--        } else if i == len(stages)-1 {
--            // Nothing follows U-Boot in this experimental profile.
-         }
-     }
++            releaseAndClose(f)
++            f = nil
++            next, err := waitForSamePort(d, 10*time.Second)
++            if err != nil { return err }
++            d = next
++            f, err = openAndClaim(d)
++            if err != nil { return fmt.Errorf("re-enumerated EUB found but interface claim failed: %w", err) }
++            logf("interface 0 reclaimed; ready for U-Boot")
++        }
++    }
++    releaseAndClose(f)
++    logf("all four DNW frames accepted by USBFS; this does NOT prove bootloader execution or Download Mode")
++    return nil
++}
++
++func main() {
++    if len(os.Args) < 2 {
++        fmt.Println("usage: hubbleusb --scan | --run <frames-directory>")
++        os.Exit(2)
++    }
++    switch os.Args[1] {
++    case "--scan":
++        d, err := findInitial(8*time.Second)
++        if err != nil { logf("SCAN FAILED: %v", err); os.Exit(1) }
++        logf("SCAN OK: %s bus=%d devnum=%d product=%q node=%s", d.Name, d.Bus, d.Dev, d.Product, usbNode(d))
++    case "--run":
++        if len(os.Args) != 3 { fmt.Println("usage: hubbleusb --run <frames-directory>"); os.Exit(2) }
++        if err := run(os.Args[2]); err != nil { logf("FATAL: %v", err); os.Exit(1) }
++    default:
++        fmt.Println("unknown command")
++        os.Exit(2)
++    }
++}
