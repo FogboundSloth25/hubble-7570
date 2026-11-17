@@ -55,6 +55,13 @@ jobs:
           test -f build-src/hubble-android/app/src/main/java/com/validity/hubble7570/MainActivity.java
           test -f build-src/hubble-android/usbhost/main.go
 
+      - name: Export extracted Android source for debugging
+        uses: actions/upload-artifact@v4
+        with:
+          name: Hubble7570-Android-source-debug
+          path: build-src/hubble-android
+          retention-days: 1
+
       - name: Build Android ARM64 USBFS helper
         working-directory: build-src/hubble-android
         run: |
