@@ -1,0 +1,104 @@
+--- a/usbhost/main.go
++++ b/usbhost/main.go
+@@ -169,7 +169,7 @@
+     }
+     logf("OUT BEGIN stage=%s frame=%d bytes (0x%X) endpoint=0x%02X timeout=%dms", filename, len(data), len(data), outEndpoint, transferTimeoutMs)
+     started := time.Now()
+-    n, err := bulkWrite(f, data) // one USBFS bulk request, including the entire U-Boot frame
++    n, err := bulkWrite(f, data) // ordered USBFS chunks preserve one contiguous DNW byte stream
+     elapsed := time.Since(started)
+     if err != nil {
+         return fmt.Errorf("OUT FAILED stage=%s after=%s transferred_reported=%d: %w; frame NOT retried", filename, elapsed, n, err)
+@@ -205,6 +205,44 @@
+     return usbDevice{}, fmt.Errorf("EUB did not return on sysfs port %s within %s", old.Name, timeout)
+ }
+ 
++// waitForOptionalSamePort watches a stage boundary where the BootROM may reset
++// the USB device. If no disconnect/re-enumeration is seen during observeWindow,
++// the current handle remains valid and the next stage can proceed. Once a
++// disconnect is observed, the function waits for the same physical USB port to
++// return and never allows writes through the stale handle.
++func waitForOptionalSamePort(old usbDevice, observeWindow, timeout time.Duration) (usbDevice, bool, error) {
++    logf("watching for optional EUB re-enumeration after BL31 on port %s (bus=%d old-devnum=%d); observe=%s timeout=%s", old.Name, old.Bus, old.Dev, observeWindow, timeout)
++    started := time.Now()
++    observeDeadline := started.Add(observeWindow)
++    deadline := started.Add(timeout)
++    sawGone := false
++
++    for time.Now().Before(deadline) {
++        var current *usbDevice
++        for _, d := range discover() {
++            if d.Name == old.Name && d.Bus == old.Bus {
++                copy := d
++                current = &copy
++                break
++            }
++        }
++
++        if current == nil {
++            if !sawGone {
++                logf("EUB disappeared after BL31; waiting for it to return on the same physical port")
++            }
++            sawGone = true
++        } else if sawGone || current.Dev != old.Dev {
++            logf("EUB re-enumerated after BL31: %s bus=%d devnum=%d product=%q", current.Name, current.Bus, current.Dev, current.Product)
++            return *current, true, nil
++        } else if !sawGone && !time.Now().Before(observeDeadline) {
++            logf("no USB re-enumeration observed after BL31 within %s; keeping existing EUB handle", observeWindow)
++            return old, false, nil
++        }
++
++        time.Sleep(10 * time.Millisecond)
++    }
++
++    if sawGone {
++        return usbDevice{}, false, fmt.Errorf("EUB disappeared after BL31 but did not return on sysfs port %s within %s; refusing to use the stale USB handle", old.Name, timeout)
++    }
++    return old, false, nil
++}
++
+ func run(framesDir string) error {
+     logf("root USBFS transport starting; looking for Samsung Exynos7570 EUB 04e8:1234")
+     d, err := findInitial(15*time.Second)
+@@ -219,7 +257,32 @@
+             releaseAndClose(f)
+             return err
+         }
+-        if stage == "bl2.dnw" {
++
++        // Match the Exynos 7570 profile's 100 ms inter-stage settling delay.
++        if i < len(stages)-1 {
++            logf("settling for 100ms after %s before the next boot stage", stage)
++            time.Sleep(100 * time.Millisecond)
++        }
++
++        if stage == "bl31.dnw" {
++            // The device trace showed USB endpoint shutdown at the first BL2
++            // write. BL31 can reset/re-enumerate the EUB interface, so watch
++            // this boundary before attempting BL2 rather than writing to a
++            // potentially stale /dev/bus/usb handle.
++            next, changed, err := waitForOptionalSamePort(d, 1*time.Second, 10*time.Second)
++            if err != nil {
++                releaseAndClose(f)
++                return err
++            }
++            if changed {
++                releaseAndClose(f)
++                f = nil
++                d = next
++                f, err = openAndClaim(d)
++                if err != nil { return fmt.Errorf("EUB re-enumerated after BL31 but interface claim failed: %w", err) }
++                logf("interface 0 reclaimed after BL31; ready for BL2")
++            }
++        } else if stage == "bl2.dnw" {
+             releaseAndClose(f)
+             f = nil
+             next, err := waitForSamePort(d, 10*time.Second)
+@@ -228,8 +291,6 @@
+             f, err = openAndClaim(d)
+             if err != nil { return fmt.Errorf("re-enumerated EUB found but interface claim failed: %w", err) }
+             logf("interface 0 reclaimed; ready for U-Boot")
+-        } else if i == len(stages)-1 {
+-            // Nothing follows U-Boot in this experimental profile.
+         }
+     }
