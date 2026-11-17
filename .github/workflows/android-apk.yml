@@ -6,7 +6,7 @@ on:
       - main
     paths:
       - "android/hubble-android-source.zip"
-      - "android/usbfs-bl31-transition.patch"
+      - "android/apply-usbfs-transition.py"
       - ".github/workflows/android-apk.yml"
   workflow_dispatch:
 
@@ -57,7 +57,7 @@ jobs:
           test -f build-src/hubble-android/usbhost/main.go
 
       - name: Apply BL31 USB re-enumeration handling
-        run: patch -p1 -d build-src/hubble-android < android/usbfs-bl31-transition.patch
+        run: python3 android/apply-usbfs-transition.py build-src/hubble-android/usbhost/main.go
 
       - name: Export extracted Android source for debugging
         uses: actions/upload-artifact@v4
