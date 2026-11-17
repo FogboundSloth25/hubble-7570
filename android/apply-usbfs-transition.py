@@ -227,7 +227,7 @@ if "waitForOptionalSamePort(d" not in s:
     end_marker = '\n\treleaseAndClose(f)\n\tlogf("all four DNW frames accepted by USBFS; this does NOT prove bootloader execution or Download Mode")'
     end = s.find(end_marker, start)
     if end < 0: raise SystemExit("cannot locate end of run stage loop")
-    loop = r'''\tstages := []string{"fwbl1.dnw", "bl31.dnw", "bl2.dnw", "u-boot.dnw"}
+    loop = '''\tstages := []string{"fwbl1.dnw", "bl31.dnw", "bl2.dnw", "u-boot.dnw"}
 \tfor _, stage := range stages {
 \t\tif err := sendStage(f, framesDir, stage); err != nil {
 \t\t\treleaseAndClose(f)
